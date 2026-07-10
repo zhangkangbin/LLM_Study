@@ -1,0 +1,24 @@
+{
+  "documents": [
+    {
+      "id": "android-crash",
+      "title": "Android 崩溃排查",
+      "text": "NullPointerException 常见于 Activity 生命周期中对象未初始化。崩溃日志应关注 FATAL EXCEPTION、Caused by、关键堆栈和最近改动。排查时先确认崩溃线程，再定位业务入口和空对象来源。"
+    },
+    {
+      "id": "android-anr",
+      "title": "Android ANR 排查",
+      "text": "ANR 表示主线程长时间无响应。常见原因包括主线程 IO、锁等待、BroadcastReceiver 超时、Service 启动阻塞和 UI 线程执行耗时任务。排查时要查看主线程堆栈和 traces 文件。"
+    },
+    {
+      "id": "rag-basics",
+      "title": "RAG 知识库问答",
+      "text": "RAG 会先把文档切分成 chunk，再生成 Embedding 向量并写入向量数据库。用户提问时，系统将问题向量化，检索相似片段，然后把片段交给大模型生成答案。"
+    },
+    {
+      "id": "chat-ui",
+      "title": "聊天界面体验",
+      "text": "Chat UI 需要处理流式输出、Markdown 渲染、代码块、加载状态、失败重试和用户取消。Android 端应关注弱网、页面销毁和后台切换。"
+    }
+  ]
+}

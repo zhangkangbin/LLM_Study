@@ -1,0 +1,20 @@
+[
+  {
+    "id": "product-refund-faq",
+    "title": "产品退款 FAQ",
+    "source_uri": "app://knowledge/product/refund",
+    "content": "用户申请退款时，需要先确认订单状态、支付渠道、购买时间和是否已经消耗权益。客服知识库应给出可退款、不可退款、需要人工复核三类处理路径。",
+    "tags": ["product", "faq", "refund"],
+    "version": "v1",
+    "owner": "operation-team"
+  },
+  {
+    "id": "account-delete-faq",
+    "title": "账号注销 FAQ",
+    "source_uri": "app://knowledge/product/account-delete",
+    "content": "账号注销会影响登录、历史数据、会员权益和设备绑定。知识库需要明确注销前置条件、冷静期、数据删除范围和用户确认文案。",
+    "tags": ["product", "faq", "account"],
+    "version": "v1",
+    "owner": "operation-team"
+  }
+]

@@ -1,0 +1,63 @@
+{
+  "snapshot_date": "2026-07-09",
+  "note": "示例价格用于学习成本估算公式。生产环境请以官方价格页和你的供应商合同为准刷新。",
+  "source": "https://developers.openai.com/api/docs/pricing",
+  "models": [
+    {
+      "id": "gpt-5.5",
+      "quality": 5,
+      "speed": 3,
+      "cost_level": 5,
+      "input_price_per_million": 5.0,
+      "cached_input_price_per_million": 0.5,
+      "output_price_per_million": 30.0,
+      "context_window": 1050000,
+      "max_output_tokens": 128000,
+      "supports_tools": true,
+      "supports_vision": true,
+      "recommended_for": ["complex_reasoning", "coding", "agent", "quality_review"]
+    },
+    {
+      "id": "gpt-5.4",
+      "quality": 4,
+      "speed": 3,
+      "cost_level": 4,
+      "input_price_per_million": 2.5,
+      "cached_input_price_per_million": 0.25,
+      "output_price_per_million": 15.0,
+      "context_window": 1050000,
+      "max_output_tokens": 128000,
+      "supports_tools": true,
+      "supports_vision": true,
+      "recommended_for": ["balanced", "coding", "rag", "android_crash_analysis"]
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "quality": 4,
+      "speed": 4,
+      "cost_level": 2,
+      "input_price_per_million": 0.75,
+      "cached_input_price_per_million": 0.075,
+      "output_price_per_million": 4.5,
+      "context_window": 400000,
+      "max_output_tokens": 128000,
+      "supports_tools": true,
+      "supports_vision": true,
+      "recommended_for": ["balanced", "rag", "android_crash_analysis", "high_volume"]
+    },
+    {
+      "id": "gpt-5.4-nano",
+      "quality": 2,
+      "speed": 5,
+      "cost_level": 1,
+      "input_price_per_million": 0.15,
+      "cached_input_price_per_million": 0.015,
+      "output_price_per_million": 0.9,
+      "context_window": 128000,
+      "max_output_tokens": 32000,
+      "supports_tools": false,
+      "supports_vision": false,
+      "recommended_for": ["classification", "simple_extraction", "high_volume", "latency_sensitive"]
+    }
+  ]
+}

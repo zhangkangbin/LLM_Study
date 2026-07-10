@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0",
+  "documents": {
+    "android-crash-guide": {
+      "checksum": "old-demo-checksum"
+    },
+    "legacy-release-note": {
+      "checksum": "removed-demo-checksum"
+    }
+  }
+}
