@@ -74,3 +74,21 @@ Android 请求后端时应该带上业务请求 ID 或让后端返回请求 ID�
 5. 是否可重试。
 
 这会极大降低排查成本。
+
+## 监控面板例子
+
+Android 知识库助手上线后，可以先做一个按场景拆分的面板：
+
+| 指标 | 维度 | 用来判断什么 |
+| --- | --- | --- |
+| `request_count` | 场景、模型、租户 | 流量是否异常 |
+| `first_delta_latency_p95` | 场景、模型 | 用户等待首字是否变慢 |
+| `total_latency_p95` | 场景、是否 RAG | 是模型慢还是检索慢 |
+| `error_rate` | 错误码、供应商 | 稳定性是否下降 |
+| `cancel_rate` | 客户端版本 | 用户是否等不及或误触 |
+| `citation_accuracy_eval` | 知识库版本 | 引用质量是否退化 |
+| `avg_cost_per_request` | 场景、模型 | 成本是否失控 |
+| `degradation_count` | 降级原因 | 哪些依赖正在变差 |
+| `safety_block_count` | 风险类型 | 是否出现攻击或误拦截 |
+
+面板最好能从一条异常指标跳到对应 trace 列表。例如 `first_delta_latency_p95` 升高时，可以直接查看最近慢请求的检索耗时、模型路由和供应商错误。

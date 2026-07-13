@@ -43,6 +43,20 @@ Android 端承接前端与后端阶段：
 2. 第十一阶段的前端状态机思想可以迁移到 Android ViewModel。
 3. Android 端只处理用户输入、状态渲染、流式事件、取消和重试。
 
+## 本阶段练习
+
+为 Android 知识库助手设计 `ChatViewModel`、`AiRepository` 和错误映射表，覆盖发送、流式追加、取消、弱网、重试、引用展示和页面销毁。练习产物可以放到 [阶段练习与自检](../阶段练习与自检.md) 对应阶段下继续扩展。
+
+## 和贯穿项目的关系
+
+贯穿项目的 Android 端是用户真正操作的入口。本阶段把后端 `/api/chat`、前端状态机和 Android 生命周期接起来，确保模型密钥不进 App，网络失败可恢复，取消和重试不会制造重复任务。
+
+## 学完后的自检问题
+
+1. 我能不能说明 `ViewModel`、`Repository`、后端网关各自负责什么？
+2. 我能不能把 401、408、429、5xx、用户取消映射成不同 UI 行为？
+3. 我能不能解释为什么页面销毁、旋转和弱网都要进入状态机设计？
+
 ## 官方资料
 
 - [Streaming API responses](https://developers.openai.com/api/docs/guides/streaming-responses)

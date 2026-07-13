@@ -53,6 +53,46 @@ data class ChatMessage(
 
 这样 UI 不需要知道网络细节，只订阅 `ChatUiState`。
 
+## ViewModel 状态转换例子
+
+下面的 reducer 伪代码展示了“状态先行”的写法：
+
+```kotlin
+fun reduce(event: ChatEvent) {
+    state = when (event) {
+        is ChatEvent.AssistantStarted -> state.copy(
+            status = ChatStatus.Waiting,
+            activeTraceId = event.traceId,
+            lastError = null
+        )
+        is ChatEvent.AssistantDelta -> {
+            if (state.status != ChatStatus.Streaming && state.status != ChatStatus.Waiting) {
+                state
+            } else {
+                state.copy(
+                    status = ChatStatus.Streaming,
+                    messages = appendDelta(state.messages, event.messageId, event.text)
+                )
+            }
+        }
+        is ChatEvent.AssistantCompleted -> state.copy(
+            status = ChatStatus.Idle,
+            messages = completeMessage(state.messages, event.messageId, event.citations)
+        )
+        is ChatEvent.UserCancelled -> state.copy(
+            status = ChatStatus.Cancelled,
+            messages = markActiveMessageCancelled(state.messages)
+        )
+        is ChatEvent.AssistantFailed -> state.copy(
+            status = ChatStatus.Error,
+            lastError = event.userMessage
+        )
+    }
+}
+```
+
+注意 `AssistantDelta` 的分支：如果当前状态已经是 `Cancelled` 或 `Error`，迟到 delta 不应该改变 UI。这条规则能同时处理取消、断网、切换会话和重新生成。
+
 ## Compose UI 规则
 
 按钮状态可以从 `ChatUiState` 派生：
@@ -85,6 +125,21 @@ Android 端可以对部分错误显示“重试”：
 | 用户取消 | 可重新生成 |
 
 真实重试要避免重复创建工单、重复提交 Agent 动作。这类任务需要后端幂等键。
+
+## Repository 错误映射例子
+
+Repository 可以把后端错误转换成 UI 能理解的稳定错误：
+
+| 后端/网络错误 | `AiFailure` | 用户文案 | 可重试 |
+| --- | --- | --- | --- |
+| 无网络 | `NetworkUnavailable` | 当前网络不可用，请检查连接 | 是 |
+| 408 或读超时 | `TimeoutBeforeFirstDelta` | 连接超时，已保留你的问题 | 是 |
+| 429 | `RateLimited` | 当前请求较多，请稍后再试 | 按 `retry_after_seconds` |
+| 401 | `Unauthorized` | 登录状态已失效，请重新登录 | 否 |
+| 5xx | `ServerError(traceId)` | 服务暂时不可用，可稍后重试 | 是 |
+| 用户取消 | `UserCancelled` | 已停止生成 | 可重新生成 |
+
+这样做的好处是 UI 文案、重试按钮和反馈入口都由业务错误决定，而不是散落在网络层异常判断里。
 
 ## 引用展示
 
