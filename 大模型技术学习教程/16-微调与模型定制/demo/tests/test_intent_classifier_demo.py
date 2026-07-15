@@ -552,6 +552,15 @@ class IntentClassifierArtifactTest(unittest.TestCase):
     def _copy_artifact(self):
         return copy.deepcopy(self.artifact)
 
+    def _artifact_with_q_feature_count(self, count):
+        artifact = self._copy_artifact()
+        statistics = artifact["statistics"]
+        statistics["feature_counts"]["cancel_order"]["q"] = count
+        statistics["total_features"]["cancel_order"] += count
+        statistics["vocabulary"].append("q")
+        statistics["vocabulary"].sort()
+        return artifact
+
     def test_artifact_has_fixed_schema_and_json_serializable_snapshot(self):
         self.assertEqual(SCHEMA_VERSION, 1)
         self.assertEqual(set(self.artifact), REQUIRED_ARTIFACT_KEYS)
@@ -643,6 +652,27 @@ class IntentClassifierArtifactTest(unittest.TestCase):
                 Thresholds(0.0, 0.0, 0.75),
                 rows,
                 model_version="below-floor",
+            )
+
+    def test_build_rejects_zero_count_feature_with_field_path(self):
+        invalid = self._artifact_with_q_feature_count(0)
+        statistics = invalid["statistics"]
+        model = demo.IntentClassifier(
+            class_counts=statistics["class_counts"],
+            feature_counts=statistics["feature_counts"],
+            total_features=statistics["total_features"],
+            vocabulary=statistics["vocabulary"],
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"statistics\.feature_counts\.cancel_order\.q",
+        ):
+            build_artifact(
+                model,
+                self.thresholds,
+                self.rows,
+                model_version="zero-feature",
             )
 
     def test_artifact_round_trip_preserves_model_prediction_exactly(self):
@@ -917,6 +947,37 @@ class IntentClassifierArtifactTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             model_from_artifact(invalid)
 
+    def test_rejects_zero_count_feature_with_field_path(self):
+        invalid = self._artifact_with_q_feature_count(0)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"statistics\.feature_counts\.cancel_order\.q",
+        ):
+            model_from_artifact(invalid)
+
+    def test_load_rejects_zero_count_feature_with_field_path(self):
+        invalid = self._artifact_with_q_feature_count(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "zero-feature.json"
+            path.write_text(json.dumps(invalid), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError,
+                r"statistics\.feature_counts\.cancel_order\.q",
+            ):
+                load_artifact(path)
+
+    def test_normal_and_positive_count_features_remain_valid(self):
+        model_from_artifact(self.artifact)
+        positive = self._artifact_with_q_feature_count(1)
+        model_from_artifact(positive)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "positive-feature.json"
+            save_artifact(positive, path)
+            load_artifact(path)
+
     def test_rejects_invalid_metadata_and_evaluation_summaries(self):
         invalid_artifacts = []
         for timestamp in ("", "2026-07-15", "2026-07-15T08:30:00+08:00"):
@@ -1055,6 +1116,39 @@ class IntentClassifierArtifactTest(unittest.TestCase):
             {
                 "accuracy": 1 / 3,
                 "accepted_accuracy": 0.0,
+            }
+        )
+
+        model_from_artifact(valid)
+
+    def test_calibration_floor_uses_strict_less_than_comparison(self):
+        invalid = self._copy_artifact()
+        invalid["thresholds"]["minimum_accepted_accuracy"] = 0.7500000000005
+        invalid["training_metadata"]["split_counts"]["validation"] = 4
+        invalid["evaluation_summary"]["validation"].update(
+            {
+                "count": 4,
+                "accuracy": 0.75,
+                "coverage": 1.0,
+                "rejection_rate": 0.0,
+                "accepted_accuracy": 0.75,
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "minimum_accepted_accuracy"):
+            model_from_artifact(invalid)
+
+    def test_calibration_floor_accepts_exact_equality(self):
+        valid = self._copy_artifact()
+        valid["thresholds"]["minimum_accepted_accuracy"] = 0.75
+        valid["training_metadata"]["split_counts"]["validation"] = 4
+        valid["evaluation_summary"]["validation"].update(
+            {
+                "count": 4,
+                "accuracy": 0.75,
+                "coverage": 1.0,
+                "rejection_rate": 0.0,
+                "accepted_accuracy": 0.75,
             }
         )
 

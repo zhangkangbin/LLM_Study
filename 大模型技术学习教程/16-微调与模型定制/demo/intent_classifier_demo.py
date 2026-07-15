@@ -540,6 +540,7 @@ def build_artifact(
     _require_non_blank_string("model_version", model_version)
     canonical_rows = _validated_artifact_rows(rows)
     statistics = model.mutable_snapshot()
+    _validate_artifact_statistics(statistics, sorted(model.class_counts))
     expected_statistics = train_classifier(canonical_rows).mutable_snapshot()
     if statistics != expected_statistics:
         raise ValueError("model statistics do not match rows")
@@ -943,7 +944,9 @@ def _validate_artifact_statistics(
                     "n-grams"
                 )
             total += _require_count(
-                f"statistics.feature_counts.{label}.{feature}", count
+                f"statistics.feature_counts.{label}.{feature}",
+                count,
+                minimum=1,
             )
             feature_union.add(feature)
         if total != total_features[label]:
@@ -1100,12 +1103,6 @@ def _validate_evaluation_summary(
         if (
             split == "validation"
             and accepted_accuracy < minimum_accepted_accuracy
-            and not math.isclose(
-                accepted_accuracy,
-                minimum_accepted_accuracy,
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
         ):
             raise ValueError(
                 "evaluation_summary.validation.accepted_accuracy must satisfy "
