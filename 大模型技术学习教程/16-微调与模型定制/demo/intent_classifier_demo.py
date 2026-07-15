@@ -54,6 +54,33 @@ class IntentClassifier:
         object.__setattr__(self, "vocabulary", vocabulary)
 
 
+@dataclass(frozen=True)
+class Thresholds:
+    confidence: float
+    margin: float
+    minimum_accepted_accuracy: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "confidence",
+            _validate_threshold("confidence", self.confidence),
+        )
+        object.__setattr__(
+            self,
+            "margin",
+            _validate_threshold("margin", self.margin),
+        )
+        object.__setattr__(
+            self,
+            "minimum_accepted_accuracy",
+            _validate_threshold(
+                "minimum_accepted_accuracy",
+                self.minimum_accepted_accuracy,
+            ),
+        )
+
+
 def load_examples(path: Path | str) -> list[dict[str, str]]:
     examples: list[dict[str, str]] = []
     with Path(path).open("r", encoding="utf-8") as source:
@@ -397,41 +424,136 @@ def evaluate_classifier(
     model: IntentClassifier,
     examples: Sequence[dict[str, str]],
     *,
-    confidence_threshold: float = 0.45,
-    margin_threshold: float = 0.10,
+    split: str,
+    thresholds: Thresholds,
 ) -> dict[str, object]:
-    test_examples = [example for example in examples if example.get("split") == "test"]
+    if split not in {"validation", "test"}:
+        raise ValueError("split must be 'validation' or 'test'")
+
+    evaluation_examples = [
+        example for example in examples if example.get("split") == split
+    ]
     actual: list[str] = []
     predicted: list[str] = []
     predictions: list[dict[str, object]] = []
+    accepted: list[dict[str, object]] = []
+    rejected: list[dict[str, object]] = []
     errors: list[dict[str, object]] = []
 
-    for example in test_examples:
+    for example in evaluation_examples:
         prediction = predict_intent(
             model,
             example["text"],
-            confidence_threshold=confidence_threshold,
-            margin_threshold=margin_threshold,
+            confidence_threshold=thresholds.confidence,
+            margin_threshold=thresholds.margin,
         )
         expected_intent = example["intent"]
         actual.append(expected_intent)
         predicted_intent = str(prediction["intent"])
         predicted.append(predicted_intent)
+        is_accepted = prediction["reason"] == "accepted"
+        is_correct = predicted_intent == expected_intent
         record = {
             "text": example["text"],
             "expected": expected_intent,
+            "accepted": is_accepted,
+            "correct": is_correct,
             **prediction,
         }
         predictions.append(record)
-        if predicted_intent != expected_intent:
+        if is_accepted:
+            accepted.append(record)
+        else:
+            rejected.append(record)
+        if is_accepted and not is_correct:
             errors.append(record)
 
     metrics = classification_metrics(actual, predicted)
-    return {**metrics, "predictions": predictions, "errors": errors}
+    correctly_accepted = sum(1 for record in accepted if record["correct"])
+    return {
+        **metrics,
+        "rejection_rate": _safe_divide(len(rejected), len(predictions)),
+        "coverage": _safe_divide(len(accepted), len(predictions)),
+        "accepted_accuracy": _safe_divide(correctly_accepted, len(accepted)),
+        "predictions": predictions,
+        "accepted": accepted,
+        "rejected": rejected,
+        "errors": errors,
+    }
+
+
+def calibrate_thresholds(
+    model: IntentClassifier,
+    examples: Sequence[dict[str, str]],
+    *,
+    confidence_values: Sequence[object] = (0.35, 0.45, 0.55, 0.65),
+    margin_values: Sequence[object] = (0.05, 0.10, 0.20, 0.30),
+    minimum_accepted_accuracy: object = 0.75,
+) -> Thresholds:
+    if not any(example.get("split") == "validation" for example in examples):
+        raise ValueError("validation split must not be empty")
+
+    confidence_grid = _validate_threshold_grid(
+        "confidence_values",
+        confidence_values,
+    )
+    margin_grid = _validate_threshold_grid("margin_values", margin_values)
+    minimum_accuracy = _validate_threshold(
+        "minimum_accepted_accuracy",
+        minimum_accepted_accuracy,
+    )
+
+    candidates: list[tuple[float, float, Thresholds]] = []
+    for confidence in confidence_grid:
+        for margin in margin_grid:
+            thresholds = Thresholds(confidence, margin, minimum_accuracy)
+            report = evaluate_classifier(
+                model,
+                examples,
+                split="validation",
+                thresholds=thresholds,
+            )
+            accepted_accuracy = float(report["accepted_accuracy"])
+            if accepted_accuracy < minimum_accuracy:
+                continue
+            macro = report["macro"]
+            assert isinstance(macro, dict)
+            candidates.append(
+                (
+                    float(macro["f1"]),
+                    float(report["coverage"]),
+                    thresholds,
+                )
+            )
+
+    if not candidates:
+        raise ValueError("no threshold pair satisfies minimum accepted accuracy")
+
+    return max(
+        candidates,
+        key=lambda candidate: (
+            candidate[0],
+            candidate[1],
+            -candidate[2].confidence,
+            -candidate[2].margin,
+        ),
+    )[2]
 
 
 def _safe_divide(numerator: float, denominator: float) -> float:
     return numerator / denominator if denominator else 0.0
+
+
+def _validate_threshold_grid(name: str, values: object) -> tuple[float, ...]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f"{name} must be a sequence")
+    try:
+        grid = tuple(values)
+    except TypeError as error:
+        raise ValueError(f"{name} must be a sequence") from error
+    if not grid:
+        raise ValueError(f"{name} must not be empty")
+    return tuple(_validate_threshold(name, value) for value in grid)
 
 
 def _validate_threshold(name: str, value: object) -> float:
@@ -441,7 +563,7 @@ def _validate_threshold(name: str, value: object) -> float:
             and math.isfinite(value)
             and 0 <= value <= 1
         )
-    except (TypeError, OverflowError):
+    except (TypeError, ValueError, OverflowError):
         valid = False
     if not valid:
         raise ValueError(f"{name} must be a finite number in [0, 1]")
@@ -492,8 +614,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             evaluate_classifier(
                 model,
                 examples,
-                confidence_threshold=args.confidence_threshold,
-                margin_threshold=args.margin_threshold,
+                split="test",
+                thresholds=Thresholds(
+                    args.confidence_threshold,
+                    args.margin_threshold,
+                    0.75,
+                ),
             )
         )
         return 0

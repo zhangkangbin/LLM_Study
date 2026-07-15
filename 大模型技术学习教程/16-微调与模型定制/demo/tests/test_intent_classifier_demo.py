@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import FrozenInstanceError
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -13,6 +15,8 @@ sys.path.insert(0, str(DEMO_DIR))
 
 import intent_classifier_demo as demo
 from intent_classifier_demo import (
+    Thresholds,
+    calibrate_thresholds,
     classification_metrics,
     evaluate_classifier,
     extract_features,
@@ -602,23 +606,190 @@ class IntentClassifierEvaluationTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["per_intent"]["query_order"]["f1"], 0.5)
         self.assertAlmostEqual(metrics["macro"]["f1"], 1 / 6)
 
-    def test_evaluation_contains_errors_and_metrics(self):
-        model = train_classifier(self.training_examples)
-        test_examples = [
-            {"text": "请取消", "intent": "cancel_order", "split": "test"},
-            {"text": "查一下物流", "intent": "query_order", "split": "test"},
+    def test_evaluation_distinguishes_rejections_from_accepted_errors(self):
+        model = train_classifier(
+            [
+                {"text": "x", "intent": "a", "split": "train"},
+                {"text": "y", "intent": "b", "split": "train"},
+            ]
+        )
+        examples = [
+            {"text": "x", "intent": "a", "split": "validation"},
+            {"text": "x", "intent": "b", "split": "validation"},
+            {"text": "z", "intent": "b", "split": "validation"},
+            {"text": "y", "intent": "b", "split": "test"},
         ]
 
         result = evaluate_classifier(
             model,
-            test_examples,
-            confidence_threshold=1.0,
-            margin_threshold=0.0,
+            examples,
+            split="validation",
+            thresholds=Thresholds(0.0, 0.0, 0.75),
         )
 
-        self.assertEqual(result["count"], 2)
-        self.assertEqual(len(result["errors"]), 2)
-        self.assertIn("macro", result)
+        self.assertEqual(result["count"], 3)
+        self.assertAlmostEqual(result["coverage"], 2 / 3)
+        self.assertAlmostEqual(result["rejection_rate"], 1 / 3)
+        self.assertEqual(result["accepted_accuracy"], 0.5)
+        self.assertEqual(len(result["accepted"]), 2)
+        self.assertEqual(len(result["rejected"]), 1)
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["rejected"][0]["reason"], "no_features")
+        self.assertEqual(result["errors"][0]["reason"], "accepted")
+        self.assertEqual(
+            [row["expected"] for row in result["predictions"]],
+            ["a", "b", "b"],
+        )
+
+    def test_evaluation_rejects_non_evaluation_splits(self):
+        model = train_classifier(self.training_examples)
+
+        with self.assertRaisesRegex(ValueError, "validation.*test"):
+            evaluate_classifier(
+                model,
+                self.training_examples,
+                split="train",
+                thresholds=Thresholds(0.0, 0.0, 0.75),
+            )
+
+
+class IntentClassifierCalibrationTest(unittest.TestCase):
+    def setUp(self):
+        self.rows = [
+            {"text": "x", "intent": "a", "split": "train"},
+            {"text": "y", "intent": "b", "split": "train"},
+            {"text": "x", "intent": "a", "split": "validation"},
+            {"text": "y", "intent": "b", "split": "validation"},
+            {"text": "x", "intent": "a", "split": "test"},
+        ]
+
+    def test_thresholds_are_immutable(self):
+        thresholds = Thresholds(0.45, 0.10, 0.75)
+
+        with self.assertRaises(FrozenInstanceError):
+            thresholds.confidence = 0.55
+
+    def test_thresholds_reject_decimal_signaling_nan_with_field_name(self):
+        for field_name in (
+            "confidence",
+            "margin",
+            "minimum_accepted_accuracy",
+        ):
+            with self.subTest(field_name=field_name):
+                values = {
+                    "confidence": 0.45,
+                    "margin": 0.10,
+                    "minimum_accepted_accuracy": 0.75,
+                    field_name: Decimal("sNaN"),
+                }
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"^{field_name} must be a finite number in \[0, 1\]$",
+                ):
+                    Thresholds(**values)
+
+    def test_thresholds_reject_out_of_range_values(self):
+        for field_name, invalid_value in (
+            ("confidence", -0.01),
+            ("margin", 1.01),
+            ("minimum_accepted_accuracy", float("inf")),
+        ):
+            with self.subTest(field_name=field_name):
+                values = {
+                    "confidence": 0.45,
+                    "margin": 0.10,
+                    "minimum_accepted_accuracy": 0.75,
+                    field_name: invalid_value,
+                }
+                with self.assertRaisesRegex(ValueError, field_name):
+                    Thresholds(**values)
+
+    def test_calibration_reads_only_validation_rows(self):
+        changed_test = [
+            (
+                dict(row, text="completely different test text", intent="changed")
+                if row["split"] == "test"
+                else row
+            )
+            for row in self.rows
+        ]
+
+        first = calibrate_thresholds(train_classifier(self.rows), self.rows)
+        second = calibrate_thresholds(
+            train_classifier(changed_test),
+            changed_test,
+        )
+
+        self.assertEqual(first, second)
+
+    def test_calibration_breaks_ties_by_lowest_thresholds(self):
+        rows = [
+            {"text": "x", "intent": "only", "split": "train"},
+            {"text": "x", "intent": "only", "split": "validation"},
+        ]
+
+        thresholds = calibrate_thresholds(
+            train_classifier(rows),
+            rows,
+            confidence_values=(0.8, 0.2),
+            margin_values=(0.9, 0.1),
+            minimum_accepted_accuracy=0.5,
+        )
+
+        self.assertEqual(thresholds, Thresholds(0.2, 0.1, 0.5))
+
+    def test_calibration_fails_when_accuracy_floor_is_unreachable(self):
+        rows = [
+            {"text": "x", "intent": "a", "split": "train"},
+            {"text": "y", "intent": "b", "split": "train"},
+            {"text": "x", "intent": "b", "split": "validation"},
+        ]
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "^no threshold pair satisfies minimum accepted accuracy$",
+        ):
+            calibrate_thresholds(
+                train_classifier(rows),
+                rows,
+                confidence_values=(0.0,),
+                margin_values=(0.0,),
+                minimum_accepted_accuracy=1.0,
+            )
+
+    def test_calibration_rejects_empty_validation_input(self):
+        rows = [{"text": "x", "intent": "a", "split": "train"}]
+
+        with self.assertRaisesRegex(ValueError, "validation split must not be empty"):
+            calibrate_thresholds(train_classifier(rows), rows)
+
+    def test_calibration_rejects_empty_or_invalid_candidate_grids(self):
+        model = train_classifier(self.rows)
+        invalid_arguments = (
+            ({"confidence_values": ()}, "confidence_values must not be empty"),
+            ({"margin_values": ()}, "margin_values must not be empty"),
+            (
+                {"confidence_values": None},
+                "confidence_values must be a sequence",
+            ),
+            (
+                {"confidence_values": (1.01,)},
+                r"confidence_values must be a finite number in \[0, 1\]",
+            ),
+            (
+                {"margin_values": (float("nan"),)},
+                r"margin_values must be a finite number in \[0, 1\]",
+            ),
+            (
+                {"minimum_accepted_accuracy": -0.01},
+                r"minimum_accepted_accuracy must be a finite number in \[0, 1\]",
+            ),
+        )
+
+        for arguments, message in invalid_arguments:
+            with self.subTest(arguments=arguments):
+                with self.assertRaisesRegex(ValueError, rf"^{message}$"):
+                    calibrate_thresholds(model, self.rows, **arguments)
 
 
 class IntentClassifierCliTest(unittest.TestCase):
