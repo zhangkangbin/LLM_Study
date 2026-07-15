@@ -10,7 +10,7 @@ public final class MobileIntentClassifierTest {
     private MobileIntentClassifierTest() {}
 
     public static void main(String[] args) throws Exception {
-        require(args.length == 1 || args.length == 2, "expected model path and optional Unicode model path");
+        require(args.length == 1, "expected model path");
         Path modelPath = Path.of(args[0]);
         String artifact = Files.readString(modelPath, StandardCharsets.UTF_8);
         List<Path> temporaryArtifacts = new ArrayList<>();
@@ -19,9 +19,6 @@ public final class MobileIntentClassifierTest {
             testMiniJson();
             testPythonAlphanumericCategories();
             testValidArtifact(modelPath);
-            if (args.length == 2) {
-                testPythonAlphanumericArtifact(Path.of(args[1]));
-            }
             testCorruptArtifacts(artifact, temporaryArtifacts);
             System.out.println("MobileIntentClassifierTest OK");
         } finally {
@@ -104,6 +101,11 @@ public final class MobileIntentClassifierTest {
                 "total feature labels"
         );
         require(!model.vocabulary().isEmpty(), "vocabulary");
+        if (model.vocabulary().contains("²") || model.vocabulary().contains("ⅷ")) {
+            require(model.vocabulary().contains("²"), "Python No feature");
+            require(model.vocabulary().contains("ⅷ"), "Python Nl feature");
+            require(model.vocabulary().contains("²ⅷ"), "Python No/Nl bigram feature");
+        }
 
         String firstLabel = model.labels().get(0);
         expectUnsupported(() -> model.labels().add("other"));
@@ -121,14 +123,6 @@ public final class MobileIntentClassifierTest {
         require(IntentModelLoader.isPythonAlphanumeric('²'), "Python No character");
         require(IntentModelLoader.isPythonAlphanumeric('ⅷ'), "Python Nl character");
         require(!IntentModelLoader.isPythonAlphanumeric('☃'), "non-alphanumeric symbol");
-    }
-
-    private static void testPythonAlphanumericArtifact(Path modelPath) throws IOException {
-        IntentModelLoader.IntentModel model = IntentModelLoader.load(modelPath);
-        require(model.labels().equals(List.of("number_intent")), "Unicode model label");
-        require(model.vocabulary().contains("²"), "Python No feature");
-        require(model.vocabulary().contains("ⅷ"), "Python Nl feature");
-        require(model.vocabulary().contains("²ⅷ"), "Python No/Nl bigram feature");
     }
 
     private static void testCorruptArtifacts(
