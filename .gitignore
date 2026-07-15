@@ -20,6 +20,7 @@ build/
 # Editor and OS noise
 .idea/
 .vscode/
+.worktrees/
 .DS_Store
 Thumbs.db
 desktop.ini
