@@ -1,5 +1,7 @@
 # Intent Classification Training Implementation Plan
 
+> **Superseded:** This plan covers the original Python-only scope. Use [Local and Android Model Training Deployment Roadmap](./2026-07-15-local-android-model-training-deployment-roadmap.md) for implementation; its portable-classifier plan adds validation calibration, model artifacts, Java parity, and Android deployment.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a standard-library-only intent classification training tutorial and runnable demo to stage 16, including data validation, Naive Bayes training, unknown rejection, evaluation metrics, CLI commands, and documentation.
