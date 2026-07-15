@@ -138,6 +138,36 @@ class MobileLlmDatasetLoadTest(unittest.TestCase):
 
             self.assertEqual([{"value": 1.25}], load_conversations(path))
 
+    def test_load_rejects_isolated_surrogates_anywhere_in_the_json_tree(self):
+        cases = {
+            "id": r'{"id":"\ud800"}',
+            "content": r'{"messages":[{"content":"\udfff"}]}',
+            "object_key": r'{"\ud800":"value"}',
+            "nested_extra": r'{"extra":{"nested":["safe","\udfff"]}}',
+        }
+        for name, invalid_line in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary_directory:
+                path = Path(temporary_directory) / "surrogate.jsonl"
+                path.write_text(f'{{}}\n{invalid_line}\n', encoding="utf-8")
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"source line 2: isolated Unicode surrogate U\+[Dd][89A-Fa-f][0-9A-Fa-f]{2}",
+                ) as caught:
+                    load_conversations(path)
+
+                str(caught.exception).encode("utf-8", errors="strict")
+
+    def test_load_accepts_real_utf8_emoji_and_a_valid_escaped_surrogate_pair(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "emoji.jsonl"
+            path.write_text(
+                '{"id":"😀"}\n' + r'{"id":"\ud83d\ude00"}' + "\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual([{"id": "😀"}, {"id": "😀"}], load_conversations(path))
+
     def test_load_rejects_duplicate_keys_inside_nested_objects(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "duplicate.jsonl"
@@ -561,13 +591,14 @@ class MobileLlmDatasetSummaryTest(unittest.TestCase):
 
 
 class MobileLlmSampleDataTest(unittest.TestCase):
-    def test_sample_has_fixed_split_counts_unique_ids_and_no_validation_issues(self):
+    def test_sample_meets_minimum_split_counts_with_unique_ids_and_no_issues(self):
         rows = load_conversations(SAMPLE_DATA_PATH)
+        split_counts = Counter(row["split"] for row in rows)
 
-        self.assertEqual(
-            Counter({"train": 8, "validation": 2, "test": 2}),
-            Counter(row["split"] for row in rows),
-        )
+        self.assertEqual(VALID_SPLITS, frozenset(split_counts))
+        self.assertGreaterEqual(split_counts["train"], 8)
+        self.assertGreaterEqual(split_counts["validation"], 2)
+        self.assertGreaterEqual(split_counts["test"], 2)
         self.assertEqual(len(rows), len({row["id"] for row in rows}))
         self.assertEqual([], validate_conversations(rows))
 
@@ -597,15 +628,13 @@ class MobileLlmSampleDataTest(unittest.TestCase):
                     f"{role}: {first}/{second}",
                 )
 
-    def test_sample_contains_required_mobile_assistant_topics(self):
+    def test_sample_user_requests_cover_required_mobile_assistant_topics(self):
         rows = load_conversations(SAMPLE_DATA_PATH)
-        conversations = [
-            "\n".join(
-                message["content"]
-                for message in row["messages"]
-                if message["role"] in {"user", "assistant"}
-            )
+        user_requests = [
+            message["content"]
             for row in rows
+            for message in row["messages"]
+            if message["role"] == "user"
         ]
         topic_terms = {
             "订单查询": ("订单", "查询"),
@@ -613,18 +642,75 @@ class MobileLlmSampleDataTest(unittest.TestCase):
             "退款": ("退款",),
             "人工转接": ("人工",),
             "简洁摘要": ("摘要",),
-            "拒绝不安全请求": ("不能", "安全"),
-            "离线能力边界": ("离线", "联网"),
+            "不安全请求": ("绕过",),
+            "离线请求": ("离线",),
         }
 
         for topic, required_terms in topic_terms.items():
             with self.subTest(topic=topic):
                 self.assertTrue(
                     any(
-                        all(term in conversation for term in required_terms)
-                        for conversation in conversations
+                        all(term in request for term in required_terms)
+                        for request in user_requests
                     )
                 )
+
+    def test_sample_assistant_behaviors_match_the_corresponding_user_request(self):
+        rows = load_conversations(SAMPLE_DATA_PATH)
+        exchanges = [
+            (
+                next(
+                    message["content"]
+                    for message in row["messages"]
+                    if message["role"] == "user"
+                ),
+                next(
+                    message["content"]
+                    for message in row["messages"]
+                    if message["role"] == "assistant"
+                ),
+            )
+            for row in rows
+        ]
+        behaviors = {
+            "安全拒绝": (("绕过",), ("不能", "安全")),
+            "离线披露": (("离线",), ("离线", "不能联网")),
+            "人工转接": (("人工",), ("人工", "记录")),
+        }
+
+        for behavior, (user_terms, assistant_terms) in behaviors.items():
+            with self.subTest(behavior=behavior):
+                self.assertTrue(
+                    any(
+                        all(term in user for term in user_terms)
+                        and all(term in assistant for term in assistant_terms)
+                        for user, assistant in exchanges
+                    )
+                )
+
+    def test_sample_summary_is_shorter_and_preserves_multiple_key_facts(self):
+        rows = load_conversations(SAMPLE_DATA_PATH)
+        summary_exchanges = [
+            (
+                message["content"],
+                next(
+                    reply["content"]
+                    for reply in row["messages"]
+                    if reply["role"] == "assistant"
+                ),
+            )
+            for row in rows
+            for message in row["messages"]
+            if message["role"] == "user" and "摘要" in message["content"]
+        ]
+
+        self.assertEqual(1, len(summary_exchanges))
+        user_text, assistant_text = summary_exchanges[0]
+        key_facts = ("快递", "后天送达", "订单页", "改址", "人工客服")
+        self.assertTrue(all(fact in user_text for fact in key_facts))
+        self.assertTrue(all(fact in assistant_text for fact in key_facts))
+        self.assertLess(len(assistant_text), len(user_text))
+        self.assertEqual(1, assistant_text.count("。"))
 
 
 class MobileLlmDatasetCliTest(unittest.TestCase):
@@ -632,6 +718,9 @@ class MobileLlmDatasetCliTest(unittest.TestCase):
         self.assertTrue(callable(getattr(dataset_demo, "main", None)))
 
     def test_default_validate_and_summarize_work_outside_the_demo_directory(self):
+        sample_rows = load_conversations(SAMPLE_DATA_PATH)
+        expected_split_counts = dict(Counter(row["split"] for row in sample_rows))
+        expected_message_count = sum(len(row["messages"]) for row in sample_rows)
         with tempfile.TemporaryDirectory() as temporary_directory:
             validate_code, validate_stdout, validate_stderr = run_cli(
                 "validate",
@@ -644,17 +733,14 @@ class MobileLlmDatasetCliTest(unittest.TestCase):
 
         self.assertEqual((0, ""), (validate_code, validate_stderr))
         self.assertEqual(
-            {"valid": True, "count": 12, "issues": []},
+            {"valid": True, "count": len(sample_rows), "issues": []},
             parse_single_json_object(validate_stdout),
         )
         self.assertEqual((0, ""), (summary_code, summary_stderr))
         summary = parse_single_json_object(summary_stdout)
-        self.assertEqual(
-            {"train": 8, "validation": 2, "test": 2},
-            summary["split_counts"],
-        )
-        self.assertEqual(12, summary["total_conversations"])
-        self.assertEqual(36, summary["total_messages"])
+        self.assertEqual(expected_split_counts, summary["split_counts"])
+        self.assertEqual(len(sample_rows), summary["total_conversations"])
+        self.assertEqual(expected_message_count, summary["total_messages"])
         self.assertEqual(
             {"characters", "split_counts", "total_conversations", "total_messages"},
             set(summary),
@@ -708,16 +794,31 @@ class MobileLlmDatasetCliTest(unittest.TestCase):
                 self.assertIn("empty_split", [issue["code"] for issue in payload["issues"]])
                 self.assertNotIn("split_counts", payload)
 
-    def test_missing_path_and_invalid_utf8_are_structured_user_errors(self):
+    def test_file_and_json_load_failures_are_structured_user_errors(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             missing = directory / "missing.jsonl"
             invalid_utf8 = directory / "invalid-utf8.jsonl"
             invalid_utf8.write_bytes(b"{}\n\xff\n")
+            duplicate_key = directory / "duplicate-key.jsonl"
+            duplicate_key.write_text(
+                '{}\n{"id":"first","id":"second"}\n',
+                encoding="utf-8",
+            )
+            overflowing_number = directory / "overflow.jsonl"
+            overflowing_number.write_text('{}\n{"value":1e400}\n', encoding="utf-8")
+            isolated_surrogate = directory / "surrogate.jsonl"
+            isolated_surrogate.write_text(
+                "{}\n" + r'{"id":"\ud800"}' + "\n",
+                encoding="utf-8",
+            )
 
             cases = {
                 "missing": (missing, "file_error"),
                 "invalid_utf8": (invalid_utf8, "invalid_data"),
+                "duplicate_key": (duplicate_key, "invalid_data"),
+                "overflowing_number": (overflowing_number, "invalid_data"),
+                "isolated_surrogate": (isolated_surrogate, "invalid_data"),
             }
             for name, (path, expected_error) in cases.items():
                 with self.subTest(name=name):
@@ -727,6 +828,8 @@ class MobileLlmDatasetCliTest(unittest.TestCase):
                     self.assertEqual(expected_error, payload["error"])
                     self.assertIsInstance(payload["message"], str)
                     self.assertTrue(payload["message"])
+                    if expected_error == "invalid_data":
+                        self.assertEqual(2, payload["line"])
 
     def test_argparse_errors_are_single_json_objects_on_stderr(self):
         cases = [
@@ -747,19 +850,24 @@ class MobileLlmDatasetCliTest(unittest.TestCase):
                 self.assertTrue(payload["message"])
 
     def test_unexpected_load_failure_is_exit_one_without_swallowing_interrupts(self):
+        secret = r"TOKEN=top-secret; path=C:\private\customer.jsonl"
         stdout = io.StringIO()
         stderr = io.StringIO()
         with patch.object(
             dataset_demo,
             "load_conversations",
-            side_effect=RuntimeError("boom"),
+            side_effect=RuntimeError(secret),
         ), redirect_stdout(stdout), redirect_stderr(stderr):
             code = dataset_demo.main(["validate"])
 
         self.assertEqual((1, ""), (code, stdout.getvalue()))
         payload = parse_single_json_object(stderr.getvalue())
-        self.assertEqual("internal_error", payload["error"])
-        self.assertIn("unexpected failure", payload["message"])
+        self.assertEqual(
+            {"error": "internal_error", "message": "unexpected internal error"},
+            payload,
+        )
+        self.assertNotIn("top-secret", stderr.getvalue())
+        self.assertNotIn(r"C:\private", stderr.getvalue())
 
         for exception in (KeyboardInterrupt(), SystemExit(9)):
             with self.subTest(exception=exception), patch.object(

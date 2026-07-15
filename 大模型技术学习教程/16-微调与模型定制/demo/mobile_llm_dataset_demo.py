@@ -44,6 +44,26 @@ def _parse_finite_json_float(value: str) -> float:
     return number
 
 
+def _reject_isolated_unicode_surrogates(value: object) -> None:
+    """Reject surrogate code points anywhere in a decoded JSON tree."""
+
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            for character in current:
+                code_point = ord(character)
+                if 0xD800 <= code_point <= 0xDFFF:
+                    raise ValueError(
+                        f"isolated Unicode surrogate U+{code_point:04X} is not allowed"
+                    )
+        elif isinstance(current, dict):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+
+
 def load_conversations(path: str | Path) -> list[dict[str, Any]]:
     """Load nonblank UTF-8 JSONL objects and report their physical source line."""
 
@@ -67,6 +87,7 @@ def load_conversations(path: str | Path) -> list[dict[str, Any]]:
                     parse_constant=_reject_nonfinite_json_number,
                     parse_float=_parse_finite_json_float,
                 )
+                _reject_isolated_unicode_surrogates(row)
             except ValueError as error:
                 raise ValueError(f"source line {line_number}: {error}") from error
 
@@ -581,10 +602,10 @@ def _write_user_error(code: str, error: Exception) -> None:
     _write_json(payload, sys.stderr)
 
 
-def _write_internal_error(error: Exception) -> None:
+def _write_internal_error(_error: Exception) -> None:
     _write_user_error(
         "internal_error",
-        RuntimeError(f"unexpected failure: {error.__class__.__name__}: {error}"),
+        RuntimeError("unexpected internal error"),
     )
 
 
