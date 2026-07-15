@@ -6,7 +6,12 @@ from pathlib import Path
 DEMO_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(DEMO_DIR))
 
-from intent_classifier_demo import validate_examples
+from intent_classifier_demo import (
+    extract_features,
+    predict_intent,
+    train_classifier,
+    validate_examples,
+)
 
 
 class IntentDataValidationTest(unittest.TestCase):
@@ -62,6 +67,45 @@ class IntentDataValidationTest(unittest.TestCase):
 
         self.assertIn("missing_test_intent", codes)
         self.assertIn("missing_train_intent", codes)
+
+
+class IntentClassifierTrainingTest(unittest.TestCase):
+    def setUp(self):
+        self.training_examples = [
+            {"text": "取消订单", "intent": "cancel_order", "split": "train"},
+            {"text": "不要这个订单", "intent": "cancel_order", "split": "train"},
+            {"text": "撤销购买", "intent": "cancel_order", "split": "train"},
+            {"text": "查询物流", "intent": "query_order", "split": "train"},
+            {"text": "订单到哪里了", "intent": "query_order", "split": "train"},
+            {"text": "查看包裹进度", "intent": "query_order", "split": "train"},
+        ]
+
+    def test_extract_features_uses_normalized_unigrams_and_bigrams(self):
+        self.assertEqual(extract_features("取消！"), ["取", "消", "取消"])
+
+    def test_training_records_classes_and_vocabulary(self):
+        model = train_classifier(self.training_examples)
+
+        self.assertEqual(model.class_counts["cancel_order"], 3)
+        self.assertEqual(model.class_counts["query_order"], 3)
+        self.assertIn("取消", model.vocabulary)
+
+    def test_trained_classifier_predicts_representative_intent(self):
+        model = train_classifier(self.training_examples)
+
+        result = predict_intent(
+            model,
+            "请帮我取消这个订单",
+            confidence_threshold=0.0,
+            margin_threshold=0.0,
+        )
+
+        self.assertEqual(result["intent"], "cancel_order")
+        self.assertEqual(result["candidates"][0]["intent"], "cancel_order")
+        self.assertAlmostEqual(
+            sum(candidate["probability"] for candidate in result["candidates"]),
+            1.0,
+        )
 
 
 if __name__ == "__main__":
