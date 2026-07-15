@@ -441,9 +441,17 @@ public final class IntentModelLoader {
         String lowered = value.toLowerCase(Locale.ROOT);
         StringBuilder normalized = new StringBuilder();
         lowered.codePoints()
-                .filter(Character::isLetterOrDigit)
+                .filter(IntentModelLoader::isPythonAlphanumeric)
                 .forEach(normalized::appendCodePoint);
         return normalized.toString();
+    }
+
+    static boolean isPythonAlphanumeric(int codePoint) {
+        if (Character.isLetterOrDigit(codePoint)) {
+            return true;
+        }
+        int type = Character.getType(codePoint);
+        return type == Character.LETTER_NUMBER || type == Character.OTHER_NUMBER;
     }
 
     private static int compareByCodePoint(String left, String right) {
