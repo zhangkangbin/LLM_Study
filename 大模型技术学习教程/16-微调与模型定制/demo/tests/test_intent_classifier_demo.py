@@ -1,3 +1,5 @@
+import copy
+import hashlib
 import io
 import json
 import math
@@ -7,8 +9,10 @@ import unittest
 from collections.abc import Iterator, Mapping
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, asdict
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 
 DEMO_DIR = Path(__file__).resolve().parents[1]
@@ -16,15 +20,22 @@ sys.path.insert(0, str(DEMO_DIR))
 
 import intent_classifier_demo as demo
 from intent_classifier_demo import (
+    REQUIRED_ARTIFACT_KEYS,
+    SCHEMA_VERSION,
     Thresholds,
+    build_artifact,
     calibrate_thresholds,
     classification_metrics,
     evaluate_classifier,
     extract_features,
+    load_artifact,
     load_examples,
     main,
+    model_from_artifact,
     normalize_text,
     predict_intent,
+    predict_with_artifact,
+    save_artifact,
     train_classifier,
     validate_examples,
 )
@@ -515,6 +526,306 @@ class IntentClassifierTrainingTest(unittest.TestCase):
         self.assertEqual(result["reason"], "no_features")
 
 
+class IntentClassifierArtifactTest(unittest.TestCase):
+    def setUp(self):
+        self.rows = [
+            {"text": "取消订单", "intent": "cancel_order", "split": "train"},
+            {"text": "查询物流", "intent": "query_order", "split": "train"},
+            {"text": "撤销购买", "intent": "cancel_order", "split": "validation"},
+            {"text": "查看包裹", "intent": "query_order", "split": "validation"},
+            {"text": "今天天气", "intent": "unknown", "split": "validation"},
+            {"text": "不要订单", "intent": "cancel_order", "split": "test"},
+            {"text": "订单到哪", "intent": "query_order", "split": "test"},
+            {"text": "播放音乐", "intent": "unknown", "split": "test"},
+        ]
+        self.model = train_classifier(self.rows)
+        self.thresholds = Thresholds(0.45, 0.10, 0.75)
+        self.frozen_time = datetime(2026, 7, 15, 8, 30, tzinfo=timezone.utc)
+        with patch.object(demo, "_utc_now", return_value=self.frozen_time):
+            self.artifact = build_artifact(
+                self.model,
+                self.thresholds,
+                self.rows,
+                model_version="demo-v1",
+            )
+
+    def _copy_artifact(self):
+        return copy.deepcopy(self.artifact)
+
+    def test_artifact_has_fixed_schema_and_json_serializable_snapshot(self):
+        self.assertEqual(SCHEMA_VERSION, 1)
+        self.assertEqual(set(self.artifact), REQUIRED_ARTIFACT_KEYS)
+        self.assertEqual(self.artifact["schema_version"], 1)
+        self.assertEqual(self.artifact["algorithm"], "multinomial_naive_bayes")
+        self.assertEqual(
+            self.artifact["normalization"],
+            {
+                "version": 1,
+                "strategy": "whole_string_lower_then_alphanumeric_filter",
+                "ngram_range": [1, 2],
+            },
+        )
+        self.assertEqual(self.artifact["labels"], sorted(self.model.class_counts))
+
+        snapshot = self.model.mutable_snapshot()
+        json.dumps(snapshot, ensure_ascii=False, allow_nan=False)
+        snapshot["class_counts"]["cancel_order"] = 999
+        self.assertNotEqual(self.model.class_counts["cancel_order"], 999)
+
+    def test_dataset_fingerprint_is_exact_and_order_invariant(self):
+        canonical_rows = sorted(
+            self.rows,
+            key=lambda row: (
+                row["split"],
+                row["intent"],
+                normalize_text(row["text"]),
+                row["text"],
+            ),
+        )
+        canonical_json = json.dumps(
+            canonical_rows,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        expected = hashlib.sha256(canonical_json).hexdigest()
+
+        with patch.object(demo, "_utc_now", return_value=self.frozen_time):
+            reordered = build_artifact(
+                self.model,
+                self.thresholds,
+                list(reversed(self.rows)),
+                model_version="demo-v1",
+            )
+
+        self.assertEqual(
+            self.artifact["training_metadata"]["dataset_sha256"],
+            expected,
+        )
+        self.assertEqual(
+            reordered["training_metadata"]["dataset_sha256"],
+            expected,
+        )
+
+    def test_build_rejects_blank_version_and_invalid_rows(self):
+        for version in ("", "   "):
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(ValueError, "model_version"):
+                    build_artifact(
+                        self.model,
+                        self.thresholds,
+                        self.rows,
+                        model_version=version,
+                    )
+
+        invalid_rows = [*self.rows, {"text": "", "intent": "bad", "split": "train"}]
+        with self.assertRaisesRegex(ValueError, "rows"):
+            build_artifact(
+                self.model,
+                self.thresholds,
+                invalid_rows,
+                model_version="demo-v1",
+            )
+
+    def test_artifact_round_trip_preserves_model_prediction_exactly(self):
+        expected = predict_intent(
+            self.model,
+            "帮我取消订单",
+            confidence_threshold=self.thresholds.confidence,
+            margin_threshold=self.thresholds.margin,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "intent-model.json"
+            save_artifact(self.artifact, path)
+            loaded = load_artifact(path)
+
+        self.assertEqual(predict_with_artifact(self.artifact, "帮我取消订单"), expected)
+        self.assertEqual(predict_with_artifact(loaded, "帮我取消订单"), expected)
+        self.assertEqual(
+            model_from_artifact(loaded).mutable_snapshot(),
+            self.model.mutable_snapshot(),
+        )
+
+    def test_stable_serialization_with_frozen_time(self):
+        with patch.object(demo, "_utc_now", return_value=self.frozen_time):
+            reordered = build_artifact(
+                train_classifier(list(reversed(self.rows))),
+                self.thresholds,
+                list(reversed(self.rows)),
+                model_version="demo-v1",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first.json"
+            second = Path(directory) / "second.json"
+            save_artifact(self.artifact, first)
+            save_artifact(reordered, second)
+
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            self.assertTrue(first.read_bytes().endswith(b"\n"))
+
+    def test_existing_artifact_requires_force(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "intent-model.json"
+            save_artifact(self.artifact, path)
+            original = path.read_bytes()
+
+            with self.assertRaises(FileExistsError):
+                save_artifact(self.artifact, path, force=False)
+            self.assertEqual(path.read_bytes(), original)
+
+            save_artifact(self.artifact, path, force=True)
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_save_requires_existing_parent_and_cleans_temp_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(FileNotFoundError):
+                save_artifact(self.artifact, root / "missing" / "model.json")
+            self.assertEqual(list(root.iterdir()), [])
+
+            path = root / "intent-model.json"
+            with patch.object(
+                demo.os,
+                "replace",
+                side_effect=OSError("replace failed"),
+            ):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    save_artifact(self.artifact, path)
+            self.assertFalse(path.exists())
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_rejects_unknown_schema_and_missing_or_unexpected_top_level_keys(self):
+        invalid_artifacts = []
+        unknown_schema = self._copy_artifact()
+        unknown_schema["schema_version"] = 2
+        invalid_artifacts.append(unknown_schema)
+        missing_key = self._copy_artifact()
+        del missing_key["algorithm"]
+        invalid_artifacts.append(missing_key)
+        unexpected_key = self._copy_artifact()
+        unexpected_key["extra"] = True
+        invalid_artifacts.append(unexpected_key)
+
+        for artifact in invalid_artifacts:
+            with self.subTest(
+                keys=set(artifact),
+                schema=artifact.get("schema_version"),
+            ):
+                with self.assertRaises(ValueError):
+                    model_from_artifact(artifact)
+
+    def test_rejects_unknown_algorithm_and_wrong_normalization_types(self):
+        invalid_artifacts = []
+        unknown_algorithm = self._copy_artifact()
+        unknown_algorithm["algorithm"] = "other"
+        invalid_artifacts.append(unknown_algorithm)
+        float_version = self._copy_artifact()
+        float_version["normalization"]["version"] = 1.0
+        invalid_artifacts.append(float_version)
+        float_ngram = self._copy_artifact()
+        float_ngram["normalization"]["ngram_range"] = [1.0, 2.0]
+        invalid_artifacts.append(float_ngram)
+
+        for artifact in invalid_artifacts:
+            with self.subTest(artifact=artifact):
+                with self.assertRaises(ValueError):
+                    model_from_artifact(artifact)
+
+    def test_rejects_nan_infinity_wrong_threshold_types_and_corrupt_json(self):
+        for value in (float("nan"), float("inf"), float("-inf"), True, "0.5"):
+            invalid = self._copy_artifact()
+            invalid["thresholds"]["confidence"] = value
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    model_from_artifact(invalid)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid.json"
+            for payload in ('{"thresholds": NaN}', '{"value": Infinity}', "{broken"):
+                with self.subTest(payload=payload):
+                    path.write_text(payload, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        load_artifact(path)
+
+    def test_rejects_negative_bool_and_inconsistent_counts(self):
+        invalid_values = (-1, True, 1.5)
+        for value in invalid_values:
+            invalid = self._copy_artifact()
+            invalid["statistics"]["class_counts"]["cancel_order"] = value
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    model_from_artifact(invalid)
+
+        invalid_total = self._copy_artifact()
+        invalid_total["statistics"]["total_features"]["cancel_order"] += 1
+        with self.assertRaises(ValueError):
+            model_from_artifact(invalid_total)
+
+        invalid_train_count = self._copy_artifact()
+        invalid_train_count["training_metadata"]["split_counts"]["train"] += 1
+        with self.assertRaises(ValueError):
+            model_from_artifact(invalid_train_count)
+
+    def test_rejects_label_and_vocabulary_mismatches(self):
+        invalid_artifacts = []
+        for labels in (
+            list(reversed(self.artifact["labels"])),
+            [*self.artifact["labels"], self.artifact["labels"][0]],
+            ["", *self.artifact["labels"]],
+        ):
+            invalid = self._copy_artifact()
+            invalid["labels"] = labels
+            invalid_artifacts.append(invalid)
+
+        missing_label = self._copy_artifact()
+        del missing_label["statistics"]["feature_counts"]["cancel_order"]
+        invalid_artifacts.append(missing_label)
+        extra_label = self._copy_artifact()
+        extra_label["statistics"]["total_features"]["extra"] = 0
+        invalid_artifacts.append(extra_label)
+        vocabulary_mismatch = self._copy_artifact()
+        vocabulary_mismatch["statistics"]["vocabulary"].append("zzz")
+        invalid_artifacts.append(vocabulary_mismatch)
+        unsorted_vocabulary = self._copy_artifact()
+        unsorted_vocabulary["statistics"]["vocabulary"].reverse()
+        invalid_artifacts.append(unsorted_vocabulary)
+
+        for artifact in invalid_artifacts:
+            with self.subTest(labels=artifact["labels"]):
+                with self.assertRaises(ValueError):
+                    model_from_artifact(artifact)
+
+    def test_rejects_invalid_metadata_and_evaluation_summaries(self):
+        invalid_artifacts = []
+        for timestamp in ("", "2026-07-15", "2026-07-15T08:30:00+08:00"):
+            invalid = self._copy_artifact()
+            invalid["training_metadata"]["trained_at"] = timestamp
+            invalid_artifacts.append(invalid)
+        for fingerprint in ("", "g" * 64, "a" * 63, "A" * 64):
+            invalid = self._copy_artifact()
+            invalid["training_metadata"]["dataset_sha256"] = fingerprint
+            invalid_artifacts.append(invalid)
+        invalid_split_count = self._copy_artifact()
+        invalid_split_count["training_metadata"]["split_counts"]["test"] = True
+        invalid_artifacts.append(invalid_split_count)
+        extra_metadata = self._copy_artifact()
+        extra_metadata["training_metadata"]["extra"] = "unexpected"
+        invalid_artifacts.append(extra_metadata)
+        invalid_summary = self._copy_artifact()
+        invalid_summary["evaluation_summary"]["test"]["accuracy"] = float("nan")
+        invalid_artifacts.append(invalid_summary)
+        inconsistent_summary = self._copy_artifact()
+        inconsistent_summary["evaluation_summary"]["test"]["count"] += 1
+        invalid_artifacts.append(inconsistent_summary)
+
+        for artifact in invalid_artifacts:
+            with self.subTest(metadata=artifact["training_metadata"]):
+                with self.assertRaises(ValueError):
+                    model_from_artifact(artifact)
+
+
 class IntentClassifierEvaluationTest(unittest.TestCase):
     def setUp(self):
         self.training_examples = [
@@ -815,11 +1126,12 @@ class IntentClassifierCalibrationTest(unittest.TestCase):
 
         self.assertEqual(first, second)
 
-    def test_calibration_never_reads_test_text(self):
+    def test_calibration_never_reads_test_text_or_intent(self):
         class PoisonTestRow(Mapping[str, str]):
             def __init__(self):
                 self.split_reads = 0
                 self.text_reads = 0
+                self.intent_reads = 0
 
             def __getitem__(self, key: str) -> str:
                 if key == "split":
@@ -829,7 +1141,8 @@ class IntentClassifierCalibrationTest(unittest.TestCase):
                     self.text_reads += 1
                     raise AssertionError("calibration read a test text")
                 if key == "intent":
-                    return "a"
+                    self.intent_reads += 1
+                    raise AssertionError("calibration read a test intent")
                 raise KeyError(key)
 
             def __iter__(self) -> Iterator[str]:
@@ -851,6 +1164,20 @@ class IntentClassifierCalibrationTest(unittest.TestCase):
 
         self.assertGreater(poison.split_reads, 0)
         self.assertEqual(poison.text_reads, 0)
+        self.assertEqual(poison.intent_reads, 0)
+
+    def test_calibration_threshold_grids_must_be_sequences(self):
+        model = train_classifier(self.rows)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "^confidence_values must be a sequence$",
+        ):
+            calibrate_thresholds(
+                model,
+                self.rows,
+                confidence_values=(value for value in (0.0, 0.5)),
+            )
 
     def test_calibration_prefers_higher_macro_f1_over_higher_coverage(self):
         rows = [

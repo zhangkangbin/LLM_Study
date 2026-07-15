@@ -1,20 +1,45 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import re
 import sys
+import tempfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 
 
 VALID_SPLITS = frozenset({"train", "validation", "test"})
 INTENT_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 DEFAULT_DATA_PATH = Path(__file__).with_name("sample_intents.jsonl")
+SCHEMA_VERSION = 1
+ALGORITHM = "multinomial_naive_bayes"
+REQUIRED_ARTIFACT_KEYS = frozenset(
+    {
+        "schema_version",
+        "model_version",
+        "algorithm",
+        "normalization",
+        "labels",
+        "thresholds",
+        "statistics",
+        "training_metadata",
+        "evaluation_summary",
+    }
+)
+_NORMALIZATION = {
+    "version": 1,
+    "strategy": "whole_string_lower_then_alphanumeric_filter",
+    "ngram_range": [1, 2],
+}
 
 
 @dataclass(frozen=True)
@@ -52,6 +77,18 @@ class IntentClassifier:
         object.__setattr__(self, "feature_counts", feature_counts)
         object.__setattr__(self, "total_features", total_features)
         object.__setattr__(self, "vocabulary", vocabulary)
+
+    def mutable_snapshot(self) -> dict[str, object]:
+        """Return JSON-ready mutable data without copying mapping proxies."""
+        return {
+            "class_counts": dict(self.class_counts),
+            "feature_counts": {
+                intent: dict(counts)
+                for intent, counts in self.feature_counts.items()
+            },
+            "total_features": dict(self.total_features),
+            "vocabulary": list(self.vocabulary),
+        }
 
 
 @dataclass(frozen=True)
@@ -490,6 +527,534 @@ def evaluate_classifier(
     }
 
 
+def build_artifact(
+    model: IntentClassifier,
+    thresholds: Thresholds,
+    rows: Sequence[Mapping[str, object]],
+    model_version: str,
+) -> dict[str, object]:
+    if not isinstance(model, IntentClassifier):
+        raise ValueError("model must be an IntentClassifier")
+    if not isinstance(thresholds, Thresholds):
+        raise ValueError("thresholds must be Thresholds")
+    _require_non_blank_string("model_version", model_version)
+    canonical_rows = _validated_artifact_rows(rows)
+    statistics = model.mutable_snapshot()
+    expected_statistics = train_classifier(canonical_rows).mutable_snapshot()
+    if statistics != expected_statistics:
+        raise ValueError("model statistics do not match rows")
+
+    split_counts = {
+        split: sum(1 for row in canonical_rows if row["split"] == split)
+        for split in sorted(VALID_SPLITS)
+    }
+    artifact: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "model_version": model_version,
+        "algorithm": ALGORITHM,
+        "normalization": {
+            "version": _NORMALIZATION["version"],
+            "strategy": _NORMALIZATION["strategy"],
+            "ngram_range": list(_NORMALIZATION["ngram_range"]),
+        },
+        "labels": sorted(model.class_counts),
+        "thresholds": {
+            "confidence": thresholds.confidence,
+            "margin": thresholds.margin,
+            "minimum_accepted_accuracy": thresholds.minimum_accepted_accuracy,
+        },
+        "statistics": statistics,
+        "training_metadata": {
+            "trained_at": _format_utc_timestamp(_utc_now()),
+            "split_counts": split_counts,
+            "dataset_sha256": _dataset_sha256(canonical_rows),
+        },
+        "evaluation_summary": {
+            split: _summarize_evaluation(
+                evaluate_classifier(
+                    model,
+                    canonical_rows,
+                    split=split,
+                    thresholds=thresholds,
+                )
+            )
+            for split in ("validation", "test")
+        },
+    }
+    validate_artifact(artifact)
+    return artifact
+
+
+def save_artifact(
+    artifact: Mapping[str, object],
+    path: Path | str,
+    *,
+    force: bool = False,
+) -> None:
+    validate_artifact(artifact)
+    if not isinstance(force, bool):
+        raise ValueError("force must be a boolean")
+
+    target = Path(path)
+    parent = target.parent
+    if not parent.exists():
+        raise FileNotFoundError(f"parent directory does not exist: {parent}")
+    if not parent.is_dir():
+        raise NotADirectoryError(f"artifact parent is not a directory: {parent}")
+    if target.exists() and not force:
+        raise FileExistsError(f"artifact already exists: {target}")
+
+    payload = json.dumps(
+        artifact,
+        ensure_ascii=False,
+        sort_keys=True,
+        indent=2,
+        allow_nan=False,
+    ) + "\n"
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=parent,
+    )
+    descriptor_open = True
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as destination:
+            descriptor_open = False
+            destination.write(payload)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temporary_name, target)
+    except BaseException:
+        if descriptor_open:
+            os.close(descriptor)
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
+
+
+def load_artifact(path: Path | str) -> dict[str, object]:
+    with Path(path).open("r", encoding="utf-8") as source:
+        artifact = json.load(
+            source,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_reject_duplicate_object_keys,
+        )
+    validate_artifact(artifact)
+    assert isinstance(artifact, dict)
+    return artifact
+
+
+def model_from_artifact(artifact: Mapping[str, object]) -> IntentClassifier:
+    validate_artifact(artifact)
+    return _model_from_validated_artifact(artifact)
+
+
+def predict_with_artifact(
+    artifact: Mapping[str, object],
+    text: str,
+) -> dict[str, object]:
+    validate_artifact(artifact)
+    if not isinstance(text, str):
+        raise ValueError("text must be a string")
+    thresholds = artifact["thresholds"]
+    assert isinstance(thresholds, Mapping)
+    return predict_intent(
+        _model_from_validated_artifact(artifact),
+        text,
+        confidence_threshold=float(thresholds["confidence"]),
+        margin_threshold=float(thresholds["margin"]),
+    )
+
+
+def validate_artifact(artifact: object) -> None:
+    root = _require_exact_mapping("artifact", artifact, REQUIRED_ARTIFACT_KEYS)
+
+    schema_version = root["schema_version"]
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != SCHEMA_VERSION
+    ):
+        raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
+    _require_non_blank_string("model_version", root["model_version"])
+    if root["algorithm"] != ALGORITHM:
+        raise ValueError(f"algorithm must be {ALGORITHM}")
+
+    normalization = _require_exact_mapping(
+        "normalization",
+        root["normalization"],
+        frozenset({"version", "strategy", "ngram_range"}),
+    )
+    if (
+        not isinstance(normalization["version"], int)
+        or isinstance(normalization["version"], bool)
+        or normalization["version"] != _NORMALIZATION["version"]
+    ):
+        raise ValueError("normalization.version must be 1")
+    if normalization["strategy"] != _NORMALIZATION["strategy"]:
+        raise ValueError("unsupported normalization.strategy")
+    ngram_range = normalization["ngram_range"]
+    if (
+        not isinstance(ngram_range, list)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in ngram_range
+        )
+        or ngram_range != _NORMALIZATION["ngram_range"]
+    ):
+        raise ValueError("normalization.ngram_range must be [1, 2]")
+
+    labels_value = root["labels"]
+    if not isinstance(labels_value, list) or not labels_value:
+        raise ValueError("labels must be a non-empty list")
+    if any(
+        not isinstance(label, str)
+        or not label.strip()
+        or not INTENT_PATTERN.fullmatch(label)
+        or label == "unknown"
+        for label in labels_value
+    ):
+        raise ValueError("labels must contain non-blank lower-snake-case strings")
+    if labels_value != sorted(labels_value) or len(labels_value) != len(
+        set(labels_value)
+    ):
+        raise ValueError("labels must be unique and sorted")
+    labels = list(labels_value)
+
+    thresholds = _require_exact_mapping(
+        "thresholds",
+        root["thresholds"],
+        frozenset({"confidence", "margin", "minimum_accepted_accuracy"}),
+    )
+    for name in ("confidence", "margin", "minimum_accepted_accuracy"):
+        _require_artifact_threshold(f"thresholds.{name}", thresholds[name])
+
+    statistics = _validate_artifact_statistics(root["statistics"], labels)
+    class_counts = statistics["class_counts"]
+    assert isinstance(class_counts, Mapping)
+    split_counts = _validate_training_metadata(
+        root["training_metadata"],
+        sum(class_counts.values()),
+    )
+    _validate_evaluation_summary(root["evaluation_summary"], split_counts)
+
+
+def _model_from_validated_artifact(
+    artifact: Mapping[str, object],
+) -> IntentClassifier:
+    statistics = artifact["statistics"]
+    assert isinstance(statistics, Mapping)
+    class_counts = statistics["class_counts"]
+    feature_counts = statistics["feature_counts"]
+    total_features = statistics["total_features"]
+    vocabulary = statistics["vocabulary"]
+    assert isinstance(class_counts, Mapping)
+    assert isinstance(feature_counts, Mapping)
+    assert isinstance(total_features, Mapping)
+    assert isinstance(vocabulary, list)
+    return IntentClassifier(
+        class_counts={label: int(value) for label, value in class_counts.items()},
+        feature_counts={
+            label: {feature: int(value) for feature, value in counts.items()}
+            for label, counts in feature_counts.items()
+        },
+        total_features={
+            label: int(value) for label, value in total_features.items()
+        },
+        vocabulary=tuple(vocabulary),
+    )
+
+
+def _validated_artifact_rows(
+    rows: object,
+) -> list[dict[str, str]]:
+    if isinstance(rows, (str, bytes)) or not isinstance(rows, Sequence):
+        raise ValueError("rows must be a sequence of dataset objects")
+    plain_rows: list[dict[str, str]] = []
+    required_fields = frozenset({"text", "intent", "split"})
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping) or set(row) != required_fields:
+            raise ValueError(f"rows[{index}] must contain exactly text, intent, split")
+        if any(not isinstance(row[field], str) for field in required_fields):
+            raise ValueError(f"rows[{index}] fields must be strings")
+        plain_rows.append(
+            {
+                "text": row["text"],
+                "intent": row["intent"],
+                "split": row["split"],
+            }
+        )
+    issues = validate_examples(plain_rows)
+    if issues:
+        raise ValueError(
+            "rows are invalid: "
+            + json.dumps(issues, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        )
+    return sorted(
+        plain_rows,
+        key=lambda row: (
+            row["split"],
+            row["intent"],
+            normalize_text(row["text"]),
+            row["text"],
+        ),
+    )
+
+
+def _dataset_sha256(rows: Sequence[Mapping[str, str]]) -> str:
+    payload = json.dumps(
+        rows,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _summarize_evaluation(report: Mapping[str, object]) -> dict[str, object]:
+    macro = report["macro"]
+    assert isinstance(macro, Mapping)
+    return {
+        "count": report["count"],
+        "accuracy": report["accuracy"],
+        "macro": {
+            "precision": macro["precision"],
+            "recall": macro["recall"],
+            "f1": macro["f1"],
+        },
+        "rejection_rate": report["rejection_rate"],
+        "coverage": report["coverage"],
+        "accepted_accuracy": report["accepted_accuracy"],
+    }
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _format_utc_timestamp(value: object) -> str:
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
+        raise ValueError("trained_at clock must return a timezone-aware datetime")
+    return (
+        value.astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _require_exact_mapping(
+    name: str,
+    value: object,
+    required_keys: frozenset[str],
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be an object")
+    actual_keys = set(value)
+    if actual_keys != required_keys:
+        missing = sorted(required_keys - actual_keys)
+        unexpected = sorted(actual_keys - required_keys, key=str)
+        raise ValueError(
+            f"{name} keys mismatch: missing={missing}, unexpected={unexpected}"
+        )
+    return value
+
+
+def _require_non_blank_string(name: str, value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-blank string")
+    return value
+
+
+def _require_artifact_threshold(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite number in [0, 1]")
+    return _validate_threshold(name, value)
+
+
+def _require_count(name: str, value: object, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        qualifier = "positive" if minimum == 1 else "non-negative"
+        raise ValueError(f"{name} must be a {qualifier} integer")
+    return value
+
+
+def _validate_artifact_statistics(
+    value: object,
+    labels: list[str],
+) -> Mapping[str, object]:
+    statistics = _require_exact_mapping(
+        "statistics",
+        value,
+        frozenset(
+            {"class_counts", "feature_counts", "total_features", "vocabulary"}
+        ),
+    )
+    label_keys = frozenset(labels)
+    class_counts = _require_exact_mapping(
+        "statistics.class_counts", statistics["class_counts"], label_keys
+    )
+    total_features = _require_exact_mapping(
+        "statistics.total_features", statistics["total_features"], label_keys
+    )
+    feature_counts = _require_exact_mapping(
+        "statistics.feature_counts", statistics["feature_counts"], label_keys
+    )
+    for label in labels:
+        _require_count(
+            f"statistics.class_counts.{label}",
+            class_counts[label],
+            minimum=1,
+        )
+        _require_count(
+            f"statistics.total_features.{label}", total_features[label]
+        )
+
+    feature_union: set[str] = set()
+    for label in labels:
+        counts = feature_counts[label]
+        if not isinstance(counts, Mapping):
+            raise ValueError(f"statistics.feature_counts.{label} must be an object")
+        total = 0
+        for feature, count in counts.items():
+            if not isinstance(feature, str) or not feature:
+                raise ValueError("feature names must be non-blank strings")
+            total += _require_count(
+                f"statistics.feature_counts.{label}.{feature}", count
+            )
+            feature_union.add(feature)
+        if total != total_features[label]:
+            raise ValueError(f"statistics.total_features.{label} is inconsistent")
+
+    vocabulary = statistics["vocabulary"]
+    if not isinstance(vocabulary, list) or any(
+        not isinstance(feature, str) or not feature for feature in vocabulary
+    ):
+        raise ValueError("statistics.vocabulary must be a list of non-blank strings")
+    if vocabulary != sorted(vocabulary) or len(vocabulary) != len(set(vocabulary)):
+        raise ValueError("statistics.vocabulary must be unique and sorted")
+    if set(vocabulary) != feature_union:
+        raise ValueError("statistics.vocabulary must match the feature union")
+    return statistics
+
+
+def _validate_training_metadata(
+    value: object,
+    total_training_examples: int,
+) -> Mapping[str, int]:
+    metadata = _require_exact_mapping(
+        "training_metadata",
+        value,
+        frozenset({"trained_at", "split_counts", "dataset_sha256"}),
+    )
+    _validate_utc_timestamp(metadata["trained_at"])
+    fingerprint = metadata["dataset_sha256"]
+    if not isinstance(fingerprint, str) or not SHA256_PATTERN.fullmatch(fingerprint):
+        raise ValueError("training_metadata.dataset_sha256 must be lowercase SHA-256")
+    split_counts = _require_exact_mapping(
+        "training_metadata.split_counts",
+        metadata["split_counts"],
+        VALID_SPLITS,
+    )
+    for split in VALID_SPLITS:
+        _require_count(
+            f"training_metadata.split_counts.{split}",
+            split_counts[split],
+            minimum=1,
+        )
+    if split_counts["train"] != total_training_examples:
+        raise ValueError("training_metadata train count is inconsistent")
+    return split_counts
+
+
+def _validate_utc_timestamp(value: object) -> None:
+    if not isinstance(value, str) or "T" not in value or not value.endswith("Z"):
+        raise ValueError(
+            "training_metadata.trained_at must be a UTC ISO-8601 timestamp"
+        )
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise ValueError(
+            "training_metadata.trained_at must be a UTC ISO-8601 timestamp"
+        ) from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise ValueError("training_metadata.trained_at must be UTC")
+
+
+def _validate_evaluation_summary(
+    value: object,
+    split_counts: Mapping[str, int],
+) -> None:
+    summaries = _require_exact_mapping(
+        "evaluation_summary", value, frozenset({"validation", "test"})
+    )
+    summary_keys = frozenset(
+        {
+            "count",
+            "accuracy",
+            "macro",
+            "rejection_rate",
+            "coverage",
+            "accepted_accuracy",
+        }
+    )
+    for split in ("validation", "test"):
+        summary = _require_exact_mapping(
+            f"evaluation_summary.{split}", summaries[split], summary_keys
+        )
+        count = _require_count(f"evaluation_summary.{split}.count", summary["count"])
+        if count != split_counts[split]:
+            raise ValueError(f"evaluation_summary.{split}.count is inconsistent")
+        for metric in (
+            "accuracy",
+            "rejection_rate",
+            "coverage",
+            "accepted_accuracy",
+        ):
+            _require_artifact_threshold(
+                f"evaluation_summary.{split}.{metric}", summary[metric]
+            )
+        if not math.isclose(
+            float(summary["coverage"]) + float(summary["rejection_rate"]),
+            1.0,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                f"evaluation_summary.{split} coverage and rejection_rate "
+                "are inconsistent"
+            )
+        macro = _require_exact_mapping(
+            f"evaluation_summary.{split}.macro",
+            summary["macro"],
+            frozenset({"precision", "recall", "f1"}),
+        )
+        for metric in ("precision", "recall", "f1"):
+            _require_artifact_threshold(
+                f"evaluation_summary.{split}.macro.{metric}", macro[metric]
+            )
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"non-finite JSON number is not allowed: {value}")
+
+
+def _reject_duplicate_object_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def calibrate_thresholds(
     model: IntentClassifier,
     examples: Sequence[dict[str, str]],
@@ -553,12 +1118,9 @@ def _safe_divide(numerator: float, denominator: float) -> float:
 
 
 def _validate_threshold_grid(name: str, values: object) -> tuple[float, ...]:
-    if isinstance(values, (str, bytes)):
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
         raise ValueError(f"{name} must be a sequence")
-    try:
-        grid = tuple(values)
-    except TypeError as error:
-        raise ValueError(f"{name} must be a sequence") from error
+    grid = tuple(values)
     if not grid:
         raise ValueError(f"{name} must not be empty")
     return tuple(_validate_threshold(name, value) for value in grid)
@@ -665,7 +1227,10 @@ def _non_blank_text(value: str) -> str:
 
 
 def _print_json(value: object, stream=None) -> None:
-    print(json.dumps(value, ensure_ascii=False, indent=2), file=stream)
+    print(
+        json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False),
+        file=stream,
+    )
 
 
 def _issue(code: str, message: str, indexes: list[int]) -> dict[str, object]:
