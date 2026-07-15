@@ -30,7 +30,12 @@ def load_examples(path: Path | str) -> list[dict[str, str]]:
         for line_number, line in enumerate(source, start=1):
             if not line.strip():
                 continue
-            value = json.loads(line)
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"line {line_number}: invalid JSON: {error.msg}"
+                ) from error
             if not isinstance(value, dict):
                 raise ValueError(f"line {line_number}: expected object")
             examples.append(value)
@@ -146,27 +151,30 @@ def validate_examples(
                 )
             )
 
-        for split in sorted(splits):
-            same_split_indexes = [
-                index
-                for index in sorted_indexes
-                if indexed_rows[index][2] == split
-            ]
-            same_split_labels = {
-                indexed_rows[index][1] for index in same_split_indexes
-            }
-            if len(same_split_indexes) < 2 or len(same_split_labels) != 1:
+        duplicate_partitions: dict[tuple[str, str], list[int]] = {}
+        for index in sorted_indexes:
+            _, intent, split = indexed_rows[index]
+            duplicate_partitions.setdefault((split, intent), []).append(index)
+
+        for same_partition_indexes in duplicate_partitions.values():
+            if len(same_partition_indexes) < 2:
                 continue
+            partition_index_set = set(same_partition_indexes)
             has_exact_duplicate = any(
-                len(exact_text_indexes[indexed_rows[index][0]]) > 1
-                for index in same_split_indexes
+                len(
+                    partition_index_set.intersection(
+                        exact_text_indexes[indexed_rows[index][0]]
+                    )
+                )
+                > 1
+                for index in same_partition_indexes
             )
             message = (
                 "同一文本重复出现"
                 if has_exact_duplicate
                 else "规范化后的同一文本重复出现"
             )
-            issues.append(_issue("duplicate_text", message, same_split_indexes))
+            issues.append(_issue("duplicate_text", message, same_partition_indexes))
 
     for split in sorted(VALID_SPLITS):
         if not split_indexes[split]:

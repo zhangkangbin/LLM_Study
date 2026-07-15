@@ -108,6 +108,20 @@ class IntentDataValidationTest(unittest.TestCase):
             {(issue["code"], tuple(issue["indexes"])) for issue in issues},
         )
 
+    def test_duplicate_wording_uses_only_reported_subgroup(self):
+        rows = self.valid + [
+            {"text": "查询，订单", "intent": "query_order", "split": "train"},
+            {"text": "查询，订单", "intent": "query_order", "split": "test"},
+        ]
+
+        duplicate_issue = next(
+            issue
+            for issue in validate_examples(rows)
+            if issue["code"] == "duplicate_text" and issue["indexes"] == [0, 5]
+        )
+
+        self.assertEqual(duplicate_issue["message"], "规范化后的同一文本重复出现")
+
     def test_conflicting_labels_are_reported(self):
         rows = self.valid + [
             {"text": "查询，订单！", "intent": "cancel_order", "split": "train"}
@@ -116,6 +130,20 @@ class IntentDataValidationTest(unittest.TestCase):
         codes = {issue["code"] for issue in validate_examples(rows)}
 
         self.assertIn("conflicting_label", codes)
+
+    def test_duplicate_partition_is_independent_of_conflicting_labels(self):
+        rows = self.valid + [
+            {"text": "查询，订单", "intent": "query_order", "split": "train"},
+            {"text": "查询订单！", "intent": "cancel_order", "split": "train"},
+        ]
+
+        diagnostics = {
+            (issue["code"], tuple(issue["indexes"]))
+            for issue in validate_examples(rows)
+        }
+
+        self.assertIn(("duplicate_text", (0, 5)), diagnostics)
+        self.assertIn(("conflicting_label", (0, 5, 6)), diagnostics)
 
     def test_empty_train_validation_or_test_split_is_reported(self):
         for split in demo.VALID_SPLITS:
@@ -205,6 +233,14 @@ class IntentDataValidationTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(ValueError, r"line 3: expected object"):
+                load_examples(path)
+
+    def test_load_examples_reports_physical_line_for_invalid_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "examples.jsonl"
+            path.write_text('\n{"text": "A"}\n{"text":\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, r"line 3: invalid JSON:"):
                 load_examples(path)
 
     def test_issues_have_deterministic_shape_and_order(self):
