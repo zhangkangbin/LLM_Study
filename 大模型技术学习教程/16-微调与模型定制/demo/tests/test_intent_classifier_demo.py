@@ -4,7 +4,9 @@ import io
 import json
 import math
 import os
+import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1848,6 +1850,8 @@ class JavaIntentClassifierParityTest(unittest.TestCase):
                 f"stderr={stderr.getvalue()}"
             )
         cls.artifact = load_artifact(cls.model_path)
+        cls._create_unicode_artifact(temporary_root)
+        cls._create_unicode_boundary_truth(temporary_root)
 
         java_sources = [
             ANDROID_DEMO_DIR / "MiniJson.java",
@@ -1881,6 +1885,163 @@ class JavaIntentClassifierParityTest(unittest.TestCase):
             )
 
     @classmethod
+    def _create_unicode_artifact(cls, temporary_root):
+        dotted_i = "\u0130"
+        squared = "\u00b2"
+        deseret_upper = "\U00010400"
+        extension_i = "\U0002EBF0"
+        final_sigma = "\u039f\u03a3"
+        non_final_sigma = "\u039f\u03a3\u0391"
+        ignored_sigma_context = "A\u03a3'A"
+        mixed = dotted_i + squared + deseret_upper + extension_i + final_sigma
+        rows = [
+            *(
+                {"text": text, "intent": "unicode_intent", "split": "train"}
+                for text in (
+                    dotted_i + squared,
+                    deseret_upper + extension_i,
+                    final_sigma,
+                    non_final_sigma,
+                    ignored_sigma_context,
+                    mixed,
+                )
+            ),
+            *(
+                {"text": text, "intent": "ascii_intent", "split": "train"}
+                for text in (
+                    "zzzero",
+                    "yyone",
+                    "qqtwo",
+                    "wwthree",
+                    "vvfour",
+                    "uufive",
+                )
+            ),
+            {
+                "text": dotted_i + squared + "v",
+                "intent": "unicode_intent",
+                "split": "validation",
+            },
+            {"text": "zzv", "intent": "ascii_intent", "split": "validation"},
+            {
+                "text": final_sigma + "t",
+                "intent": "unicode_intent",
+                "split": "test",
+            },
+            {"text": "zzt", "intent": "ascii_intent", "split": "test"},
+        ]
+        issues = validate_examples(rows)
+        if issues:
+            raise AssertionError(f"invalid Unicode parity rows: {issues}")
+        model = train_classifier(rows)
+        artifact = build_artifact(
+            model,
+            Thresholds(0.0, 0.0, 0.0),
+            rows,
+            "java-unicode-file-parity-v1",
+        )
+        cls.unicode_model_path = temporary_root / "Unicode 模型.json"
+        save_artifact(artifact, cls.unicode_model_path)
+        cls.unicode_artifact = artifact
+        cls.unicode_parity_texts = (
+            dotted_i,
+            squared,
+            deseret_upper,
+            extension_i,
+            final_sigma,
+            non_final_sigma,
+            "A'\u03a3",
+            ignored_sigma_context,
+            mixed,
+        )
+
+    @classmethod
+    def _create_unicode_boundary_truth(cls, temporary_root):
+        source = (ANDROID_DEMO_DIR / "MobileIntentClassifier.java").read_text(
+            encoding="utf-8"
+        )
+
+        def java_int_array(name):
+            match = re.search(
+                rf"private static final int\[\] {name} = \{{(.*?)\n        \}};",
+                source,
+                re.DOTALL,
+            )
+            if match is None:
+                raise AssertionError(f"missing Java Unicode table: {name}")
+            return [
+                int(token, 0)
+                for token in re.findall(r"-?0x[0-9A-F]+|-?\d+", match.group(1))
+            ]
+
+        lower_mappings = java_int_array("LOWER_MAPPINGS")
+        cased_ranges = java_int_array("CASED_RANGES")
+        ignorable_ranges = java_int_array("CASE_IGNORABLE_RANGES")
+        if len(lower_mappings) // 4 != 177:
+            raise AssertionError("expected 177 compressed lower mapping groups")
+        if len(cased_ranges) // 2 != 174:
+            raise AssertionError("expected 174 Cased ranges")
+        if len(ignorable_ranges) // 2 != 491:
+            raise AssertionError("expected 491 Case_Ignorable ranges")
+
+        normalization_probes = {
+            code_point
+            for code_point in range(0x110000)
+            if chr(code_point).lower() != chr(code_point)
+        }
+        if len(normalization_probes) != 1433:
+            raise AssertionError("expected 1433 Unicode 15.1 lower-changing codepoints")
+        for offset in range(0, len(lower_mappings), 4):
+            start, end = lower_mappings[offset : offset + 2]
+            for boundary in (start, end):
+                normalization_probes.update(
+                    code_point
+                    for code_point in (boundary - 1, boundary, boundary + 1)
+                    if 0 <= code_point <= 0x10FFFF
+                )
+
+        cls.normalization_boundary_truth = (
+            temporary_root / "normalization-boundaries.bin"
+        )
+        payload = bytearray(struct.pack(">I", len(normalization_probes)))
+        for code_point in sorted(normalization_probes):
+            normalized = "".join(
+                character
+                for character in chr(code_point).lower()
+                if character.isalnum()
+            )
+            if len(normalized) > 1:
+                raise AssertionError("single-codepoint normalization expanded unexpectedly")
+            payload.extend(
+                struct.pack(">Ii", code_point, ord(normalized) if normalized else -1)
+            )
+        cls.normalization_boundary_truth.write_bytes(payload)
+
+        sigma_probes = set()
+        for ranges in (cased_ranges, ignorable_ranges):
+            for offset in range(0, len(ranges), 2):
+                for boundary in ranges[offset : offset + 2]:
+                    sigma_probes.update(
+                        code_point
+                        for code_point in (boundary - 1, boundary, boundary + 1)
+                        if 0 <= code_point <= 0x10FFFF
+                    )
+        cls.final_sigma_boundary_truth = temporary_root / "final-sigma-boundaries.bin"
+        payload = bytearray(struct.pack(">I", len(sigma_probes)))
+        for code_point in sorted(sigma_probes):
+            character = chr(code_point)
+            payload.extend(struct.pack(">I", code_point))
+            payload.extend(
+                (
+                    (character + "\u03a3").lower().endswith("\u03c2"),
+                    ("A" + character + "\u03a3").lower().endswith("\u03c2"),
+                    ("A\u03a3" + character).lower()[1] == "\u03c2",
+                    ("A\u03a3" + character + "A").lower()[1] == "\u03c2",
+                )
+            )
+        cls.final_sigma_boundary_truth.write_bytes(payload)
+
+    @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "temporary_directory"):
             cls.temporary_directory.cleanup()
@@ -1912,6 +2073,8 @@ class JavaIntentClassifierParityTest(unittest.TestCase):
         process = subprocess.run(
             [
                 self.java,
+                f"-Dintent.normalization.boundary.truth={self.normalization_boundary_truth}",
+                f"-Dintent.final_sigma.boundary.truth={self.final_sigma_boundary_truth}",
                 "-cp",
                 str(self.classes_directory),
                 "MobileIntentClassifierTest",
@@ -1927,6 +2090,28 @@ class JavaIntentClassifierParityTest(unittest.TestCase):
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual(process.stderr, "")
         self.assertEqual(process.stdout.strip(), "MobileIntentClassifierTest OK")
+
+    def test_java_truth_probe_rejects_corrupted_compact_truth(self):
+        corrupted = Path(self.temporary_directory.name) / "corrupted-truth.bin"
+        corrupted.write_bytes(b"bad")
+        process = subprocess.run(
+            [
+                self.java,
+                f"-Dintent.normalization.boundary.truth={corrupted}",
+                "-cp",
+                str(self.classes_directory),
+                "MobileIntentClassifierTest",
+                str(self.model_path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+            check=False,
+        )
+
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("normalization boundary truth length", process.stderr)
 
     def test_java_cli_matches_python_for_every_parity_case(self):
         for case in load_examples(PARITY_CASES):
@@ -2016,6 +2201,106 @@ class JavaIntentClassifierParityTest(unittest.TestCase):
                 self.assertEqual(payload["error"], expected_error)
                 if expected_error == "model_load_failed":
                     self.assertIn("不存在 模型.json", payload["message"])
+
+    def test_java_text_file_preserves_unicode_and_matches_python(self):
+        corrupted_argv_prediction = predict_with_artifact(
+            self.unicode_artifact, "?"
+        )
+        self.assertEqual(corrupted_argv_prediction["reason"], "no_features")
+
+        for index, text in enumerate(self.unicode_parity_texts):
+            with self.subTest(text=ascii(text)):
+                text_path = Path(self.temporary_directory.name) / f"input-{index}.txt"
+                text_path.write_text(text, encoding="utf-8")
+                expected = predict_with_artifact(self.unicode_artifact, text)
+                self.assertNotEqual(expected, corrupted_argv_prediction)
+                self.assertEqual(expected["intent"], "unicode_intent")
+                self.assertEqual(expected["reason"], "accepted")
+                process = self.invoke_java(
+                    "--model",
+                    str(self.unicode_model_path),
+                    "--text-file",
+                    str(text_path),
+                )
+
+                self.assertEqual(process.returncode, 0, process.stderr)
+                self.assertEqual(process.stderr, "")
+                actual = self.assert_single_json_document(process.stdout)
+                self.assertEqual(actual["intent"], expected["intent"])
+                self.assertEqual(actual["reason"], expected["reason"])
+                self.assertEqual(
+                    [candidate["intent"] for candidate in actual["candidates"]],
+                    [candidate["intent"] for candidate in expected["candidates"]],
+                )
+                for java_candidate, python_candidate in zip(
+                    actual["candidates"], expected["candidates"]
+                ):
+                    self.assertLessEqual(
+                        abs(
+                            java_candidate["probability"]
+                            - python_candidate["probability"]
+                        ),
+                        1e-9,
+                    )
+                self.assertLessEqual(
+                    abs(actual["confidence"] - expected["confidence"]),
+                    1e-9,
+                )
+                self.assertLessEqual(
+                    abs(actual["margin"] - expected["margin"]),
+                    1e-9,
+                )
+
+    def test_java_cli_rejects_ambiguous_options_and_invalid_text_files(self):
+        root = Path(self.temporary_directory.name)
+        empty = root / "empty.txt"
+        empty.write_bytes(b"")
+        blank = root / "blank.txt"
+        blank.write_text("  \r\n", encoding="utf-8")
+        malformed = root / "malformed.txt"
+        malformed.write_bytes(b"\xc3\x28")
+        oversized = root / "oversized.txt"
+        oversized.write_bytes(b"x" * (1024 * 1024 + 1))
+        missing = root / "missing.txt"
+        model = str(self.model_path)
+        invalid_arguments = (
+            ("--model", model, "--text", "--model"),
+            ("--model", "--text", "--text", "x"),
+            ("--model", model, "--model", model, "--text", "x"),
+            ("--model", model, "--text", "x", "--text", "y"),
+            ("--model", model, "--text-file", str(empty), "--text-file", str(blank)),
+            ("--model", model, "--text", "x", "--text-file", str(empty)),
+            ("--model",),
+            ("--model", model),
+            ("--text", "x"),
+            ("--model", model, "--text-file"),
+            ("--model", model, "--unknown", "x"),
+            ("--unknown-one", "x", "--model", model, "--text", "x"),
+            ("--unknown-two", "--model", "--model", model, "--text", "x"),
+            ("--model", model, "--text", "--unknown"),
+            ("--model", model, "--text", ""),
+        )
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments):
+                process = self.invoke_java(*arguments)
+                self.assertEqual(process.returncode, 2)
+                self.assertEqual(process.stdout, "")
+                payload = self.assert_single_json_document(process.stderr)
+                self.assertEqual(payload["error"], "invalid_arguments")
+
+        invalid_files = (missing, root, empty, blank, malformed, oversized)
+        for text_path in invalid_files:
+            with self.subTest(text_path=text_path):
+                process = self.invoke_java(
+                    "--model",
+                    model,
+                    "--text-file",
+                    str(text_path),
+                )
+                self.assertEqual(process.returncode, 2)
+                self.assertEqual(process.stdout, "")
+                payload = self.assert_single_json_document(process.stderr)
+                self.assertEqual(payload["error"], "text_load_failed")
 
 
 class IntentClassifierCliTest(unittest.TestCase):

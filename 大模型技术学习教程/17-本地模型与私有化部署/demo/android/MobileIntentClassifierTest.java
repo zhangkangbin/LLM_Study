@@ -22,6 +22,8 @@ public final class MobileIntentClassifierTest {
             testMiniJson();
             testMiniJsonNestingLimits();
             testPythonUnicode151Truth();
+            testPythonNormalizationBoundaryTruth();
+            testPythonFinalSigmaBoundaryTruth();
             testPythonNormalizationTruth();
             testPythonFinalSigmaTruth();
             testPythonAlphanumericCategories();
@@ -403,6 +405,102 @@ public final class MobileIntentClassifierTest {
         require(
                 mismatches == 0,
                 "normalization mismatches=" + mismatches
+                        + ", first=" + String.format("U+%04X", firstMismatch)
+        );
+    }
+
+    private static void testPythonNormalizationBoundaryTruth() throws IOException {
+        String truthPath = System.getProperty("intent.normalization.boundary.truth");
+        if (truthPath == null) {
+            return;
+        }
+        byte[] truth = Files.readAllBytes(Path.of(truthPath));
+        require(truth.length >= 4, "normalization boundary truth length");
+        int count = readBigEndianInt(truth, 0);
+        require(
+                count >= 0 && truth.length == 4L + (long) count * 8L,
+                "normalization boundary truth length"
+        );
+        int mismatches = 0;
+        int firstMismatch = -1;
+        int previousCodePoint = -1;
+        for (int index = 0; index < count; index++) {
+            int offset = 4 + index * 8;
+            int codePoint = readBigEndianInt(truth, offset);
+            int expected = readBigEndianInt(truth, offset + 4);
+            require(
+                    codePoint > previousCodePoint
+                            && Character.isValidCodePoint(codePoint),
+                    "normalization boundary truth codepoint order"
+            );
+            previousCodePoint = codePoint;
+            String actual = MobileIntentClassifier.normalizeText(
+                    new String(Character.toChars(codePoint))
+            );
+            int[] actualCodePoints = actual.codePoints().toArray();
+            boolean matches = expected == -1
+                    ? actualCodePoints.length == 0
+                    : actualCodePoints.length == 1 && actualCodePoints[0] == expected;
+            if (!matches) {
+                mismatches++;
+                if (firstMismatch < 0) {
+                    firstMismatch = codePoint;
+                }
+            }
+        }
+        require(
+                mismatches == 0,
+                "normalization boundary mismatches=" + mismatches
+                        + ", first=" + String.format("U+%04X", firstMismatch)
+        );
+    }
+
+    private static void testPythonFinalSigmaBoundaryTruth() throws IOException {
+        String truthPath = System.getProperty("intent.final_sigma.boundary.truth");
+        if (truthPath == null) {
+            return;
+        }
+        byte[] truth = Files.readAllBytes(Path.of(truthPath));
+        require(truth.length >= 4, "Final Sigma boundary truth length");
+        int count = readBigEndianInt(truth, 0);
+        require(
+                count >= 0 && truth.length == 4L + (long) count * 8L,
+                "Final Sigma boundary truth length"
+        );
+        int mismatches = 0;
+        int firstMismatch = -1;
+        int previousCodePoint = -1;
+        for (int index = 0; index < count; index++) {
+            int offset = 4 + index * 8;
+            int codePoint = readBigEndianInt(truth, offset);
+            require(
+                    codePoint > previousCodePoint
+                            && Character.isValidCodePoint(codePoint),
+                    "Final Sigma boundary truth codepoint order"
+            );
+            previousCodePoint = codePoint;
+            String probe = new String(Character.toChars(codePoint));
+            int[] actual = {
+                    finalSigmaAtEnd(probe + "Σ"),
+                    finalSigmaAtEnd("A" + probe + "Σ"),
+                    finalSigmaAfterA("AΣ" + probe),
+                    finalSigmaAfterA("AΣ" + probe + "A")
+            };
+            for (int context = 0; context < actual.length; context++) {
+                int flag = truth[offset + 4 + context] & 0xFF;
+                require(flag <= 1, "Final Sigma boundary truth flag");
+                int expected = flag == 0 ? 0x03C3 : 0x03C2;
+                if (actual[context] != expected) {
+                    mismatches++;
+                    if (firstMismatch < 0) {
+                        firstMismatch = codePoint;
+                    }
+                }
+            }
+        }
+        require(
+                mismatches == 0,
+                "Final Sigma boundary mismatches=" + mismatches
                         + ", first=" + String.format("U+%04X", firstMismatch)
         );
     }

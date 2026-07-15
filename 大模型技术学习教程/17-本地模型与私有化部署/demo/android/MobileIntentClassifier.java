@@ -1,7 +1,12 @@
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -10,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 
 public final class MobileIntentClassifier {
+    private static final int MAX_TEXT_FILE_BYTES = 1024 * 1024;
     private static final String UNKNOWN_INTENT = "unknown";
 
     private final IntentModelLoader.IntentModel model;
@@ -180,12 +186,25 @@ public final class MobileIntentClassifier {
             return 2;
         }
 
+        String text;
+        try {
+            text = arguments.text() != null
+                    ? arguments.text()
+                    : readTextFile(arguments.textFilePath());
+        } catch (IOException | IllegalArgumentException error) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new IllegalStateException("CLI interrupted", error);
+            }
+            writeError(stderr, "text_load_failed", error.getMessage());
+            return 2;
+        }
+
         try {
             IntentModelLoader.IntentModel loaded = IntentModelLoader.load(
                     arguments.modelPath()
             );
             Prediction prediction = new MobileIntentClassifier(loaded).predict(
-                    arguments.text()
+                    text
             );
             stdout.println(predictionJson(prediction));
             return 0;
@@ -205,19 +224,83 @@ public final class MobileIntentClassifier {
     }
 
     private static CliArguments parseArguments(String[] args) {
-        if (args == null
-                || args.length != 4
-                || !"--model".equals(args[0])
-                || !"--text".equals(args[2])
-                || args[1] == null
-                || args[1].isBlank()
-                || args[3] == null
-                || args[3].isBlank()) {
+        if (args == null) {
+            throw invalidArguments();
+        }
+        String model = null;
+        String text = null;
+        String textFile = null;
+        for (int index = 0; index < args.length; index += 2) {
+            if (index + 1 >= args.length) {
+                throw invalidArguments();
+            }
+            String option = args[index];
+            String value = args[index + 1];
+            if (value == null || value.isBlank() || value.startsWith("--")) {
+                throw invalidArguments();
+            }
+            if ("--model".equals(option)) {
+                if (model != null) {
+                    throw invalidArguments();
+                }
+                model = value;
+            } else if ("--text".equals(option)) {
+                if (text != null) {
+                    throw invalidArguments();
+                }
+                text = value;
+            } else if ("--text-file".equals(option)) {
+                if (textFile != null) {
+                    throw invalidArguments();
+                }
+                textFile = value;
+            } else {
+                throw invalidArguments();
+            }
+        }
+        if (model == null || (text == null) == (textFile == null)) {
+            throw invalidArguments();
+        }
+        return new CliArguments(
+                Path.of(model),
+                text,
+                textFile == null ? null : Path.of(textFile)
+        );
+    }
+
+    private static IllegalArgumentException invalidArguments() {
+        return new IllegalArgumentException(
+                "usage: MobileIntentClassifier --model PATH "
+                        + "(--text TEXT | --text-file PATH)"
+        );
+    }
+
+    private static String readTextFile(Path path) throws IOException {
+        byte[] encoded;
+        try (InputStream input = Files.newInputStream(path)) {
+            encoded = input.readNBytes(MAX_TEXT_FILE_BYTES + 1);
+        }
+        if (encoded.length > MAX_TEXT_FILE_BYTES) {
             throw new IllegalArgumentException(
-                    "usage: MobileIntentClassifier --model PATH --text TEXT"
+                    "text file exceeds maximum size of "
+                            + MAX_TEXT_FILE_BYTES
+                            + " bytes"
             );
         }
-        return new CliArguments(Path.of(args[1]), args[3]);
+        String text;
+        try {
+            text = StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(encoded))
+                    .toString();
+        } catch (CharacterCodingException error) {
+            throw new IOException("text file is not valid UTF-8", error);
+        }
+        if (text.isBlank()) {
+            throw new IllegalArgumentException("text file must not be blank");
+        }
+        return text;
     }
 
     private static PrintWriter utf8Writer(java.io.OutputStream stream) {
@@ -392,7 +475,7 @@ public final class MobileIntentClassifier {
 
     private record ScoredIntent(String intent, double value) {}
 
-    private record CliArguments(Path modelPath, String text) {}
+    private record CliArguments(Path modelPath, String text, Path textFilePath) {}
 
     private static final class Unicode151 {
         private Unicode151() {}
