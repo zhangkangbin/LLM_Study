@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import argparse
 import json
+import math
+import re
+import sys
 import unicodedata
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn, Sequence, TextIO
 
 
 VALID_SPLITS = frozenset({"train", "validation", "test"})
@@ -15,6 +19,9 @@ VALID_ROLES = frozenset({"system", "user", "assistant"})
 _SPLIT_ORDER = ("train", "validation", "test")
 _ROW_FIELDS = frozenset({"id", "split", "messages"})
 _MESSAGE_FIELDS = frozenset({"role", "content"})
+_DEFAULT_DATA_PATH = Path(__file__).with_name("sample_mobile_llm_chat.jsonl")
+_DEFAULT_MAX_CHARACTERS = 4096
+_SOURCE_LINE_PATTERN = re.compile(r"\bsource line (\d+):")
 
 
 def _json_object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -26,8 +33,15 @@ def _json_object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[st
     return result
 
 
-def _reject_nonfinite_json_number(value: str) -> None:
+def _reject_nonfinite_json_number(value: str) -> NoReturn:
     raise ValueError(f"non-finite JSON number {value!r} is not allowed")
+
+
+def _parse_finite_json_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        _reject_nonfinite_json_number(value)
+    return number
 
 
 def load_conversations(path: str | Path) -> list[dict[str, Any]]:
@@ -51,6 +65,7 @@ def load_conversations(path: str | Path) -> list[dict[str, Any]]:
                     line,
                     object_pairs_hook=_json_object_without_duplicate_keys,
                     parse_constant=_reject_nonfinite_json_number,
+                    parse_float=_parse_finite_json_float,
                 )
             except ValueError as error:
                 raise ValueError(f"source line {line_number}: {error}") from error
@@ -111,6 +126,7 @@ def _validate_messages(
     invalid_role_positions: list[int] = []
     invalid_content_positions: list[int] = []
     empty_content_positions: list[int] = []
+    empty_normalized_content_positions: list[int] = []
     roles: list[str] = []
     exact_messages: list[tuple[str, str]] = []
     total_characters = 0
@@ -139,6 +155,8 @@ def _validate_messages(
             total_characters += len(content)
             if not content.strip():
                 empty_content_positions.append(message_index)
+            elif not _normalized_content(content):
+                empty_normalized_content_positions.append(message_index)
 
         if (
             role_is_valid
@@ -189,6 +207,14 @@ def _validate_messages(
                 [row_index],
             )
         )
+    if empty_normalized_content_positions:
+        issues.append(
+            _issue(
+                "empty_normalized_content",
+                f"row {row_index} messages at positions {empty_normalized_content_positions} require content that remains after normalization",
+                [row_index],
+            )
+        )
     if total_characters > max_characters:
         issues.append(
             _issue(
@@ -234,6 +260,7 @@ def _validate_messages(
         and not invalid_message_positions
         and not invalid_content_positions
         and not empty_content_positions
+        and not empty_normalized_content_positions
     )
     conversation_key = (
         tuple(exact_messages)
@@ -471,3 +498,142 @@ def summarize_conversations(rows: Iterable[object]) -> dict[str, object]:
         "total_messages": len(character_lengths),
         "characters": character_summary,
     }
+
+
+class _CliArgumentError(ValueError):
+    """An argparse usage error that can be rendered as JSON."""
+
+
+class _JsonArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        raise _CliArgumentError(message)
+
+
+def _positive_integer(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def _build_argument_parser() -> argparse.ArgumentParser:
+    parser = _JsonArgumentParser(
+        description="Validate or summarize the mobile LLM Chat JSONL dataset."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    validate_parser = subparsers.add_parser(
+        "validate",
+        help="validate Chat JSONL data",
+    )
+    validate_parser.add_argument(
+        "--data",
+        type=Path,
+        default=_DEFAULT_DATA_PATH,
+        help="JSONL path (default: the sample beside this script)",
+    )
+    validate_parser.add_argument(
+        "--max-characters",
+        type=_positive_integer,
+        default=_DEFAULT_MAX_CHARACTERS,
+        help="positive per-conversation character limit (default: 4096)",
+    )
+
+    summarize_parser = subparsers.add_parser(
+        "summarize",
+        help="validate and summarize Chat JSONL data",
+    )
+    summarize_parser.add_argument(
+        "--data",
+        type=Path,
+        default=_DEFAULT_DATA_PATH,
+        help="JSONL path (default: the sample beside this script)",
+    )
+    return parser
+
+
+def _write_json(payload: dict[str, object], stream: TextIO) -> None:
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n"
+    binary_stream = getattr(stream, "buffer", None)
+    if binary_stream is not None:
+        binary_stream.write(serialized.encode("utf-8"))
+        binary_stream.flush()
+    else:
+        stream.write(serialized)
+        stream.flush()
+
+
+def _write_user_error(code: str, error: Exception) -> None:
+    message = str(error) or error.__class__.__name__
+    payload: dict[str, object] = {"error": code, "message": message}
+    line_match = _SOURCE_LINE_PATTERN.search(message)
+    if line_match is not None:
+        payload["line"] = int(line_match.group(1))
+    _write_json(payload, sys.stderr)
+
+
+def _write_internal_error(error: Exception) -> None:
+    _write_user_error(
+        "internal_error",
+        RuntimeError(f"unexpected failure: {error.__class__.__name__}: {error}"),
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the standard-library CLI and return its process exit code."""
+
+    try:
+        arguments = _build_argument_parser().parse_args(argv)
+    except _CliArgumentError as error:
+        _write_user_error("argument_error", error)
+        return 2
+
+    try:
+        rows = load_conversations(arguments.data)
+    except ValueError as error:
+        _write_user_error("invalid_data", error)
+        return 2
+    except OSError as error:
+        _write_user_error("file_error", error)
+        return 2
+    except Exception as error:
+        _write_internal_error(error)
+        return 1
+
+    try:
+        max_characters = (
+            arguments.max_characters
+            if arguments.command == "validate"
+            else _DEFAULT_MAX_CHARACTERS
+        )
+        issues = validate_conversations(rows, max_characters=max_characters)
+        validation = {
+            "valid": not issues,
+            "count": len(rows),
+            "issues": issues,
+        }
+        if issues:
+            _write_json(validation, sys.stderr)
+            return 2
+
+        if arguments.command == "validate":
+            _write_json(validation, sys.stdout)
+        else:
+            _write_json(summarize_conversations(rows), sys.stdout)
+        return 0
+    except Exception as error:
+        _write_internal_error(error)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
