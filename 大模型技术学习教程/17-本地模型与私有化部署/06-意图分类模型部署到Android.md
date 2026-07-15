@@ -176,38 +176,41 @@ class IntentPredictor(
 
 正式下载流程至少做到：
 
-1. 下载到目标目录内的临时文件，而不是直接覆盖当前文件。
+1. 下载到目标私有目录内的 staged 临时文件，保证它与版本文件位于同一文件系统。
 2. 期望 SHA-256 来自 HTTPS 下的可信或签名发布清单；只从同一下载响应读取哈希不能证明真实性。
-3. 校验大小和 SHA-256，再调用 `IntentModelLoader.load` 验证 schema、algorithm、normalization 和统计量。
-4. 验证完成后原子发布版本文件，再原子切换 `current` 指针。
-5. 保留上一版文件；新版本启动或 smoke test 失败时把指针切回上一版。
-6. schema、algorithm 或 normalization 不兼容时拒绝更新，继续使用旧版本。
+3. 对 staged 文件校验大小和 SHA-256，再调用 `IntentModelLoader.load` 验证 schema、algorithm、normalization 和统计量。
+4. 用 hard link 原子 no-clobber 发布 content-addressed 不可变版本文件；同名目标已存在时必须失败，不能覆盖。
+5. staged 删除后，不可变版本 hard link 仍指向同一份已经验证的文件内容。
+6. 用同目录临时文件写入版本文件名，刷新到磁盘后原子替换小型 `current` 指针。
+7. 保留切换前的版本名和上一版文件；新版本启动或 smoke test 失败时原子切回上一版。
+8. schema、algorithm 或 normalization 不兼容时拒绝更新，继续使用旧版本。
 
 ## 8. 下载校验与原子切换核心代码
 
-下面 Java 片段省略网络框架，只接收已经建立的下载流。临时文件、版本文件和 `current` 指针都在同一目录，确保原子移动不会跨文件系统：
+下面 Java 片段省略网络框架，只接收已经建立的下载流。staged 文件、不可变版本文件和 `current` 指针都在同一个应用私有目录；版本文件名同时包含发布版本和完整 SHA-256：
 
 ```java
-static Path installVersion(
+record InstallResult(Path activeVersion, String previousVersionFile) {}
+
+static InstallResult installVersion(
         Path directory,
         String version,
         String expectedSha256,
         InputStream body
 ) throws Exception {
-    if (!version.matches("[A-Za-z0-9._-]+")
+    if (version == null || expectedSha256 == null
+            || version.length() > 64
+            || !version.matches("[A-Za-z0-9._-]+")
             || !expectedSha256.matches("[0-9a-f]{64}")) {
         throw new IllegalArgumentException("invalid model version or SHA-256");
     }
     Files.createDirectories(directory);
-    Path versionFile = directory.resolve("intent-model-" + version + ".json");
-    if (Files.exists(versionFile)) {
-        throw new IllegalStateException("model version already exists");
-    }
-    Path download = Files.createTempFile(directory, ".download-", ".tmp");
-    Path pointerTemp = null;
+    String artifactName = "intent-model-" + version + "-" + expectedSha256 + ".json";
+    Path versionFile = directory.resolve(artifactName);
+    Path staged = Files.createTempFile(directory, ".download-", ".staged");
     try {
         try (InputStream input = body;
-             FileOutputStream output = new FileOutputStream(download.toFile())) {
+             FileOutputStream output = new FileOutputStream(staged.toFile())) {
             byte[] buffer = new byte[8192];
             long total = 0;
             for (int count; (count = input.read(buffer)) != -1;) {
@@ -217,31 +220,69 @@ static Path installVersion(
                 }
                 output.write(buffer, 0, count);
             }
+            output.flush();
             output.getFD().sync();
         }
 
-        if (!sha256(download).equals(expectedSha256)) {
+        if (!sha256(staged).equals(expectedSha256)) {
             throw new SecurityException("intent model SHA-256 mismatch");
         }
-        IntentModelLoader.load(download); // 不兼容或损坏时在切换前失败
+        IntentModelLoader.load(staged); // 所有兼容性检查都发生在发布前
 
-        Files.move(download, versionFile, StandardCopyOption.ATOMIC_MOVE);
-        pointerTemp = Files.createTempFile(directory, ".current-", ".tmp");
+        // 参数顺序是 link, existing。创建操作对同名目标是真正的 no-clobber；
+        // 目标已存在时抛 FileAlreadyExistsException，不会覆盖不可变版本。
+        Files.createLink(versionFile, staged);
+        Files.delete(staged); // versionFile 仍保留同一已验证 inode
+
+        Path currentPointer = directory.resolve("current");
+        String previousVersionFile = readCurrentPointer(currentPointer);
+        replaceCurrentPointer(directory, artifactName);
+        return new InstallResult(versionFile, previousVersionFile);
+    } finally {
+        Files.deleteIfExists(staged);
+    }
+}
+
+static String readCurrentPointer(Path currentPointer) throws IOException {
+    try {
+        String value = new String(
+                Files.readAllBytes(currentPointer),
+                StandardCharsets.UTF_8
+        ).trim();
+        if (value.isEmpty() || value.contains("/") || value.contains("\\")) {
+            throw new IOException("invalid current model pointer");
+        }
+        return value;
+    } catch (NoSuchFileException missing) {
+        return null;
+    }
+}
+
+static void replaceCurrentPointer(Path directory, String artifactName)
+        throws IOException {
+    if (artifactName == null || artifactName.isBlank()
+            || artifactName.contains("/") || artifactName.contains("\\")) {
+        throw new IllegalArgumentException("invalid model pointer target");
+    }
+    Path pointerTemp = Files.createTempFile(directory, ".current-", ".tmp");
+    try {
         try (FileOutputStream output = new FileOutputStream(pointerTemp.toFile())) {
-            output.write(versionFile.getFileName().toString()
-                    .getBytes(StandardCharsets.UTF_8));
+            output.write(artifactName.getBytes(StandardCharsets.UTF_8));
+            output.flush();
             output.getFD().sync();
         }
-        Files.move(
-                pointerTemp,
-                directory.resolve("current"),
-                StandardCopyOption.ATOMIC_MOVE,
-                StandardCopyOption.REPLACE_EXISTING
-        );
-        return versionFile;
+        try {
+            Files.move(
+                    pointerTemp,
+                    directory.resolve("current"),
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING
+            );
+        } catch (AtomicMoveNotSupportedException unsupported) {
+            throw new IOException("atomic current-pointer switch is unavailable", unsupported);
+        }
     } finally {
-        Files.deleteIfExists(download);
-        if (pointerTemp != null) Files.deleteIfExists(pointerTemp);
+        Files.deleteIfExists(pointerTemp);
     }
 }
 
@@ -261,7 +302,14 @@ static String sha256(Path path) throws Exception {
 }
 ```
 
-`ATOMIC_MOVE` 不受文件系统支持时应让本次更新失败并保留旧指针，不要无提示降级成“先删旧文件再复制”。版本文件使用不可变文件名，成功切换后仍保留上一版；确认新版本稳定后再清理更旧版本。
+这里有两个不同的原子边界：
+
+1. `Files.createLink(versionFile, staged)` 发布不可变内容。它要求 Android API 26、staged 与 versionFile 位于同一文件系统，并要求应用私有文件系统支持 hard link。目标存在、API 或文件系统不支持时都安全失败，旧模型和旧指针不变；不要退化成可能覆盖目标的 `Files.move`。
+2. `current` 只是保存版本文件名的小型指针。只有它允许 `ATOMIC_MOVE + REPLACE_EXISTING`；若抛出 `AtomicMoveNotSupportedException`，更新失败且不做非原子 fallback。
+
+进程崩溃发生在下载或校验阶段，只会留下 staged 文件；发生在 `createLink` 之后、删除 staged 或切换指针之前，可能同时留下 staged 名和一个已验证但未激活的不可变 hard link，旧 `current` 仍有效；发生在 pointer temp 写入阶段，只会多一个临时指针；发生在原子指针切换之后，读取者只会看到完整的新指针。启动清理可以删除过期 staged、pointer temp 和未被 current/previous 引用的版本，但不能提前删除上一版。
+
+`InstallResult.previousVersionFile` 记录切换前的版本名。回滚时先重新加载该不可变文件确认仍兼容，再调用 `replaceCurrentPointer(directory, previousVersionFile)` 原子切回。并发发布同一个 artifact 时，只有一个 `createLink` 成功，其他安装者得到 `FileAlreadyExistsException`；不同版本之间仍应由上层串行化更新或比较发布代次，避免旧任务最后写入 `current`。
 
 ## 9. 兼容性与资源边界
 
