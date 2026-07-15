@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import re
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +12,7 @@ from typing import Sequence
 
 
 INTENT_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+DEFAULT_DATA_PATH = Path(__file__).with_name("sample_intents.jsonl")
 
 
 @dataclass(frozen=True)
@@ -296,6 +299,76 @@ def _safe_divide(numerator: float, denominator: float) -> float:
     return numerator / denominator if denominator else 0.0
 
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="离线意图识别与分类训练 Demo")
+    parser.add_argument("--data", type=Path, default=DEFAULT_DATA_PATH)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("validate", help="校验 JSONL 数据集")
+
+    evaluate_parser = subparsers.add_parser("evaluate", help="训练并评估分类器")
+    _add_threshold_arguments(evaluate_parser)
+
+    predict_parser = subparsers.add_parser("predict", help="训练并预测一条文本")
+    predict_parser.add_argument("--text", required=True)
+    _add_threshold_arguments(predict_parser)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        examples = load_examples(args.data)
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        _print_json({"error": "data_load_failed", "message": str(error)}, sys.stderr)
+        return 2
+
+    issues = validate_examples(examples)
+    if args.command == "validate":
+        _print_json({"valid": not issues, "count": len(examples), "issues": issues})
+        return 0 if not issues else 1
+
+    if issues:
+        _print_json({"error": "invalid_dataset", "issues": issues}, sys.stderr)
+        return 2
+
+    try:
+        model = train_classifier(examples)
+    except ValueError as error:
+        _print_json({"error": "training_failed", "message": str(error)}, sys.stderr)
+        return 2
+
+    if args.command == "evaluate":
+        _print_json(
+            evaluate_classifier(
+                model,
+                examples,
+                confidence_threshold=args.confidence_threshold,
+                margin_threshold=args.margin_threshold,
+            )
+        )
+        return 0
+
+    _print_json(
+        predict_intent(
+            model,
+            args.text,
+            confidence_threshold=args.confidence_threshold,
+            margin_threshold=args.margin_threshold,
+        )
+    )
+    return 0
+
+
+def _add_threshold_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--confidence-threshold", type=float, default=0.45)
+    parser.add_argument("--margin-threshold", type=float, default=0.10)
+
+
+def _print_json(value: object, stream=None) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2), file=stream)
+
+
 def _normalize_for_identity(text: str) -> str:
     return "".join(character.lower() for character in text if character.isalnum())
 
@@ -307,3 +380,7 @@ def _issue(
     if indexes is not None:
         issue["indexes"] = indexes
     return issue
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,5 +1,8 @@
+import io
+import json
 import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 
@@ -10,10 +13,14 @@ from intent_classifier_demo import (
     classification_metrics,
     evaluate_classifier,
     extract_features,
+    main,
     predict_intent,
     train_classifier,
     validate_examples,
 )
+
+
+SAMPLE_DATA = DEMO_DIR / "sample_intents.jsonl"
 
 
 class IntentDataValidationTest(unittest.TestCase):
@@ -195,6 +202,48 @@ class IntentClassifierEvaluationTest(unittest.TestCase):
         self.assertEqual(result["count"], 2)
         self.assertEqual(len(result["errors"]), 2)
         self.assertIn("macro", result)
+
+
+class IntentClassifierCliTest(unittest.TestCase):
+    def test_validate_command_returns_json_success(self):
+        with redirect_stdout(io.StringIO()) as output:
+            exit_code = main(["--data", str(SAMPLE_DATA), "validate"])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(payload["valid"])
+        self.assertEqual(payload["count"], 39)
+
+    def test_evaluate_command_returns_metrics(self):
+        with redirect_stdout(io.StringIO()) as output:
+            exit_code = main(["--data", str(SAMPLE_DATA), "evaluate"])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["count"], 15)
+        self.assertIn("confusion_matrix", payload)
+        self.assertIn("macro", payload)
+
+    def test_predict_command_returns_candidates(self):
+        with redirect_stdout(io.StringIO()) as output:
+            exit_code = main(
+                [
+                    "--data",
+                    str(SAMPLE_DATA),
+                    "predict",
+                    "--text",
+                    "帮我取消订单",
+                    "--confidence-threshold",
+                    "0",
+                    "--margin-threshold",
+                    "0",
+                ]
+            )
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["intent"], "cancel_order")
+        self.assertIn("candidates", payload)
 
 
 if __name__ == "__main__":
