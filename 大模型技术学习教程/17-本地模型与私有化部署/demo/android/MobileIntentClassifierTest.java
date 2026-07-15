@@ -1,8 +1,10 @@
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 
@@ -17,8 +19,11 @@ public final class MobileIntentClassifierTest {
 
         try {
             testMiniJson();
+            testMiniJsonNestingLimits();
+            testPythonUnicode151Truth();
             testPythonAlphanumericCategories();
             testValidArtifact(modelPath);
+            testLoaderResourceLimits(modelPath, temporaryArtifacts);
             testCorruptArtifacts(artifact, temporaryArtifacts);
             System.out.println("MobileIntentClassifierTest OK");
         } finally {
@@ -106,6 +111,11 @@ public final class MobileIntentClassifierTest {
             require(model.vocabulary().contains("ⅷ"), "Python Nl feature");
             require(model.vocabulary().contains("²ⅷ"), "Python No/Nl bigram feature");
         }
+        if (Boolean.getBoolean("intent.expect.unicode15_1")) {
+            String extensionI = new String(Character.toChars(0x2EBF0));
+            require(model.vocabulary().contains(extensionI), "Unicode 15.1 CJK feature");
+            require(model.vocabulary().contains(extensionI + "²"), "Unicode 15.1 CJK bigram");
+        }
 
         String firstLabel = model.labels().get(0);
         expectUnsupported(() -> model.labels().add("other"));
@@ -116,13 +126,128 @@ public final class MobileIntentClassifierTest {
         expectUnsupported(() -> model.vocabulary().clear());
     }
 
+    private static void testMiniJsonNestingLimits() {
+        require(MiniJson.parse(nestedArray(64)) instanceof List<?>, "depth 64 JSON");
+        require(MiniJson.parse(nestedObject(64)) instanceof Map<?, ?>, "depth 64 object JSON");
+        expectParseError(nestedArray(5000));
+        expectParseError(nestedArray(65));
+        expectParseError(nestedObject(65));
+    }
+
+    private static String nestedArray(int depth) {
+        return "[".repeat(depth) + "0" + "]".repeat(depth);
+    }
+
+    private static String nestedObject(int depth) {
+        return "{\"value\":".repeat(depth) + "0" + "}".repeat(depth);
+    }
+
     private static void testPythonAlphanumericCategories() {
         require(Character.getType('²') == Character.OTHER_NUMBER, "No category evidence");
         require(Character.getType('ⅷ') == Character.LETTER_NUMBER, "Nl category evidence");
         require(IntentModelLoader.isPythonAlphanumeric('a'), "Python alphabetic character");
         require(IntentModelLoader.isPythonAlphanumeric('²'), "Python No character");
         require(IntentModelLoader.isPythonAlphanumeric('ⅷ'), "Python Nl character");
+        require(IntentModelLoader.isPythonAlphanumeric(0x2EBF0), "Unicode 15.1 CJK feature");
         require(!IntentModelLoader.isPythonAlphanumeric('☃'), "non-alphanumeric symbol");
+        require(IntentModelLoader.isPythonAlphanumeric('A'), "uppercase is alphanumeric");
+        require(IntentModelLoader.isPythonAlphanumeric('İ'), "dotted I is alphanumeric");
+        require(!IntentModelLoader.isPythonAlphanumeric(0x0378), "unassigned is not alphanumeric");
+        require(IntentModelLoader.isPythonLowerStable('a'), "lowercase is lower-stable");
+        require(IntentModelLoader.isPythonLowerStable('²'), "No is lower-stable");
+        require(IntentModelLoader.isPythonLowerStable('ⅷ'), "Nl is lower-stable");
+        require(IntentModelLoader.isPythonLowerStable(0x2EBF0), "Unicode 15.1 CJK is lower-stable");
+        require(!IntentModelLoader.isPythonLowerStable('A'), "uppercase is not lower-stable");
+        require(!IntentModelLoader.isPythonLowerStable('İ'), "dotted I is not lower-stable");
+        require(IntentModelLoader.isPythonLowerStable('☃'), "symbol is lower-stable");
+        require(IntentModelLoader.isPythonLowerStable(0x0378), "unassigned is lower-stable");
+    }
+
+    private static void testPythonUnicode151Truth() throws IOException {
+        String truthPath = System.getProperty("intent.unicode15_1.truth");
+        if (truthPath == null) {
+            return;
+        }
+        int codePointCount = Character.MAX_CODE_POINT + 1;
+        byte[] truth = Files.readAllBytes(Path.of(truthPath));
+        require(truth.length == codePointCount * 2, "Unicode truth table length");
+        int mismatches = 0;
+        int firstMismatch = -1;
+        int lowerMismatches = 0;
+        int firstLowerMismatch = -1;
+        for (int codePoint = 0; codePoint < codePointCount; codePoint++) {
+            boolean expected = truth[codePoint * 2] != 0;
+            if (IntentModelLoader.isPythonAlphanumeric(codePoint) != expected) {
+                mismatches++;
+                if (firstMismatch < 0) {
+                    firstMismatch = codePoint;
+                }
+            }
+            boolean expectedLowerStable = truth[codePoint * 2 + 1] != 0;
+            if (IntentModelLoader.isPythonLowerStable(codePoint) != expectedLowerStable) {
+                lowerMismatches++;
+                if (firstLowerMismatch < 0) {
+                    firstLowerMismatch = codePoint;
+                }
+            }
+        }
+        require(
+                mismatches == 0,
+                "Unicode 15.1 alnum mismatches=" + mismatches
+                        + ", first=" + String.format("U+%04X", firstMismatch)
+        );
+        require(
+                lowerMismatches == 0,
+                "Unicode 15.1 lower-stable mismatches=" + lowerMismatches
+                        + ", first=" + String.format("U+%04X", firstLowerMismatch)
+        );
+    }
+
+    private static void testLoaderResourceLimits(
+            Path smallModelPath,
+            List<Path> temporaryArtifacts
+    ) throws IOException {
+        require(IntentModelLoader.load(smallModelPath).schemaVersion() == 1, "small artifact");
+
+        Path oversized = Files.createTempFile("oversized-intent-model-", ".json");
+        temporaryArtifacts.add(oversized);
+        writeRepeatedByte(
+                oversized,
+                IntentModelLoader.MAX_ARTIFACT_BYTES + 1,
+                (byte) ' '
+        );
+        try {
+            IntentModelLoader.load(oversized);
+            throw new AssertionError("expected oversized artifact rejection");
+        } catch (IllegalArgumentException expected) {
+            require(
+                    expected.getMessage().contains("artifact exceeds maximum size"),
+                    "artifact size error source"
+            );
+        }
+
+        Path malformedUtf8 = Files.createTempFile("malformed-intent-model-", ".json");
+        temporaryArtifacts.add(malformedUtf8);
+        Files.write(malformedUtf8, new byte[] {(byte) 0xC3, (byte) 0x28});
+        try {
+            IntentModelLoader.load(malformedUtf8);
+            throw new AssertionError("expected malformed UTF-8 rejection");
+        } catch (IOException expected) {
+            require(expected.getMessage().contains("UTF-8"), "UTF-8 error source");
+        }
+    }
+
+    private static void writeRepeatedByte(Path path, int count, byte value) throws IOException {
+        byte[] block = new byte[8192];
+        Arrays.fill(block, value);
+        try (OutputStream output = Files.newOutputStream(path)) {
+            int remaining = count;
+            while (remaining > 0) {
+                int length = Math.min(remaining, block.length);
+                output.write(block, 0, length);
+                remaining -= length;
+            }
+        }
     }
 
     private static void testCorruptArtifacts(
@@ -260,12 +385,23 @@ public final class MobileIntentClassifierTest {
                 ),
                 temporaryArtifacts
         );
-        expectInvalidArtifact(
+        expectInvalidFeatureArtifact(
                 replaceFirstFeatureName(artifact, "A"),
                 temporaryArtifacts
         );
-        expectInvalidArtifact(
+        expectInvalidFeatureArtifact(
                 replaceFirstFeatureName(artifact, "☃"),
+                temporaryArtifacts
+        );
+        expectInvalidFeatureArtifact(
+                replaceFirstFeatureName(artifact, "İ"),
+                temporaryArtifacts
+        );
+        expectInvalidFeatureArtifact(
+                replaceFirstFeatureName(
+                        artifact,
+                        new String(Character.toChars(0x0378))
+                ),
                 temporaryArtifacts
         );
         expectInvalidArtifact(
@@ -337,6 +473,27 @@ public final class MobileIntentClassifierTest {
         }
     }
 
+    private static void expectInvalidFeatureArtifact(
+            String source,
+            List<Path> temporaryArtifacts
+    ) throws IOException {
+        MiniJson.parse(source);
+        Path path = Files.createTempFile("invalid-intent-feature-", ".json");
+        temporaryArtifacts.add(path);
+        Files.writeString(path, source, StandardCharsets.UTF_8);
+        try {
+            IntentModelLoader.load(path);
+            throw new AssertionError("expected invalid feature artifact: " + path);
+        } catch (IllegalArgumentException expected) {
+            require(
+                    expected.getMessage().contains(
+                            "features must be normalized one- or two-code-point n-grams"
+                    ),
+                    "feature validation error source"
+            );
+        }
+    }
+
     private static String insertTopLevelMember(String source, String member) {
         require(source.charAt(0) == '{', "artifact object start");
         return "{" + member + "," + source.substring(1);
@@ -399,7 +556,7 @@ public final class MobileIntentClassifierTest {
         require(featureStart >= 0 && featureEnd > featureStart, "feature name");
         return source.substring(0, featureStart + 1)
                 + replacement
-                + source.substring(featureEnd);
+                + source.substring(featureEnd - 1);
     }
 
     private static String replaceFirstObjectKey(

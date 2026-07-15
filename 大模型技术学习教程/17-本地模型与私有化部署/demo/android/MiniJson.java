@@ -5,6 +5,8 @@ import java.util.List;
 import java.util.Map;
 
 public final class MiniJson {
+    private static final int MAX_NESTING_DEPTH = 64;
+
     private MiniJson() {}
 
     public static Object parse(String source) {
@@ -17,6 +19,7 @@ public final class MiniJson {
     private static final class Parser {
         private final String source;
         private int position;
+        private int nestingDepth;
 
         private Parser(String source) {
             this.source = source;
@@ -55,6 +58,15 @@ public final class MiniJson {
         }
 
         private Map<String, Object> parseObject() {
+            enterContainer();
+            try {
+                return parseObjectContents();
+            } finally {
+                nestingDepth--;
+            }
+        }
+
+        private Map<String, Object> parseObjectContents() {
             position++;
             skipWhitespace();
             Map<String, Object> result = new LinkedHashMap<>();
@@ -85,6 +97,15 @@ public final class MiniJson {
         }
 
         private List<Object> parseArray() {
+            enterContainer();
+            try {
+                return parseArrayContents();
+            } finally {
+                nestingDepth--;
+            }
+        }
+
+        private List<Object> parseArrayContents() {
             position++;
             skipWhitespace();
             List<Object> result = new ArrayList<>();
@@ -266,6 +287,15 @@ public final class MiniJson {
                 }
                 position++;
             }
+        }
+
+        private void enterContainer() {
+            if (nestingDepth >= MAX_NESTING_DEPTH) {
+                throw error(
+                        "maximum JSON nesting depth of " + MAX_NESTING_DEPTH + " exceeded"
+                );
+            }
+            nestingDepth++;
         }
 
         private boolean consume(char expected) {
