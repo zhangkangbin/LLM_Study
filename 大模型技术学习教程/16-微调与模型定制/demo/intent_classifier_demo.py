@@ -601,8 +601,6 @@ def save_artifact(
         raise FileNotFoundError(f"parent directory does not exist: {parent}")
     if not parent.is_dir():
         raise NotADirectoryError(f"artifact parent is not a directory: {parent}")
-    if target.exists() and not force:
-        raise FileExistsError(f"artifact already exists: {target}")
 
     payload = json.dumps(
         artifact,
@@ -623,7 +621,11 @@ def save_artifact(
             destination.write(payload)
             destination.flush()
             os.fsync(destination.fileno())
-        os.replace(temporary_name, target)
+        if force:
+            os.replace(temporary_name, target)
+        else:
+            os.link(temporary_name, target)
+            os.unlink(temporary_name)
     except BaseException:
         if descriptor_open:
             os.close(descriptor)
@@ -921,7 +923,7 @@ def _validate_artifact_statistics(
             raise ValueError(f"statistics.feature_counts.{label} must be an object")
         total = 0
         for feature, count in counts.items():
-            if not isinstance(feature, str) or not feature:
+            if not isinstance(feature, str) or not feature.strip():
                 raise ValueError("feature names must be non-blank strings")
             total += _require_count(
                 f"statistics.feature_counts.{label}.{feature}", count
@@ -932,7 +934,8 @@ def _validate_artifact_statistics(
 
     vocabulary = statistics["vocabulary"]
     if not isinstance(vocabulary, list) or any(
-        not isinstance(feature, str) or not feature for feature in vocabulary
+        not isinstance(feature, str) or not feature.strip()
+        for feature in vocabulary
     ):
         raise ValueError("statistics.vocabulary must be a list of non-blank strings")
     if vocabulary != sorted(vocabulary) or len(vocabulary) != len(set(vocabulary)):
@@ -1019,15 +1022,43 @@ def _validate_evaluation_summary(
             _require_artifact_threshold(
                 f"evaluation_summary.{split}.{metric}", summary[metric]
             )
+        _ratio_count(
+            f"evaluation_summary.{split}.accuracy",
+            summary["accuracy"],
+            count,
+        )
+        accepted_count = _ratio_count(
+            f"evaluation_summary.{split}.coverage",
+            summary["coverage"],
+            count,
+        )
+        rejected_count = _ratio_count(
+            f"evaluation_summary.{split}.rejection_rate",
+            summary["rejection_rate"],
+            count,
+        )
         if not math.isclose(
             float(summary["coverage"]) + float(summary["rejection_rate"]),
             1.0,
             rel_tol=0.0,
             abs_tol=1e-12,
-        ):
+        ) or accepted_count + rejected_count != count:
             raise ValueError(
                 f"evaluation_summary.{split} coverage and rejection_rate "
                 "are inconsistent"
+            )
+        accepted_accuracy = float(summary["accepted_accuracy"])
+        if accepted_count == 0:
+            if accepted_accuracy != 0.0:
+                raise ValueError(
+                    f"evaluation_summary.{split}.accepted_accuracy must be 0 "
+                    "when coverage is 0"
+                )
+        else:
+            _ratio_count(
+                f"evaluation_summary.{split}.accepted_accuracy",
+                accepted_accuracy,
+                accepted_count,
             )
         macro = _require_exact_mapping(
             f"evaluation_summary.{split}.macro",
@@ -1038,6 +1069,14 @@ def _validate_evaluation_summary(
             _require_artifact_threshold(
                 f"evaluation_summary.{split}.macro.{metric}", macro[metric]
             )
+
+
+def _ratio_count(name: str, ratio: object, count: int) -> int:
+    scaled = float(ratio) * count
+    nearest = round(scaled)
+    if not math.isclose(scaled, nearest, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError(f"{name} is impossible for count {count}")
+    return nearest
 
 
 def _reject_json_constant(value: str) -> object:

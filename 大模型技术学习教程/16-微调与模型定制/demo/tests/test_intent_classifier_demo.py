@@ -692,9 +692,31 @@ class IntentClassifierArtifactTest(unittest.TestCase):
                 side_effect=OSError("replace failed"),
             ):
                 with self.assertRaisesRegex(OSError, "replace failed"):
-                    save_artifact(self.artifact, path)
+                    save_artifact(self.artifact, path, force=True)
             self.assertFalse(path.exists())
             self.assertEqual(list(root.iterdir()), [])
+
+    def test_force_false_does_not_overwrite_target_created_during_publish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "intent-model.json"
+            racer_payload = "created by another writer\n"
+            real_link = demo.os.link
+
+            def create_racer_then_publish(source, destination):
+                path.write_text(racer_payload, encoding="utf-8")
+                return real_link(source, destination)
+
+            with patch.object(
+                demo.os,
+                "link",
+                side_effect=create_racer_then_publish,
+            ):
+                with self.assertRaises(FileExistsError):
+                    save_artifact(self.artifact, path, force=False)
+
+            self.assertEqual(path.read_text(encoding="utf-8"), racer_payload)
+            self.assertEqual(list(root.iterdir()), [path])
 
     def test_rejects_unknown_schema_and_missing_or_unexpected_top_level_keys(self):
         invalid_artifacts = []
@@ -797,6 +819,36 @@ class IntentClassifierArtifactTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     model_from_artifact(artifact)
 
+    def test_rejects_whitespace_only_feature_names(self):
+        invalid = self._copy_artifact()
+        statistics = invalid["statistics"]
+        counts = statistics["feature_counts"]["cancel_order"]
+        other_features = set(statistics["feature_counts"]["query_order"])
+        feature = next(value for value in counts if value not in other_features)
+        count = counts.pop(feature)
+        counts["   "] = count
+        vocabulary = statistics["vocabulary"]
+        vocabulary[vocabulary.index(feature)] = "   "
+        vocabulary.sort()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "^feature names must be non-blank strings$",
+        ):
+            model_from_artifact(invalid)
+
+    def test_rejects_whitespace_only_vocabulary_entries(self):
+        invalid = self._copy_artifact()
+        vocabulary = invalid["statistics"]["vocabulary"]
+        vocabulary[0] = "\t  "
+        vocabulary.sort()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^statistics\.vocabulary must be a list of non-blank strings$",
+        ):
+            model_from_artifact(invalid)
+
     def test_rejects_invalid_metadata_and_evaluation_summaries(self):
         invalid_artifacts = []
         for timestamp in ("", "2026-07-15", "2026-07-15T08:30:00+08:00"):
@@ -824,6 +876,46 @@ class IntentClassifierArtifactTest(unittest.TestCase):
             with self.subTest(metadata=artifact["training_metadata"]):
                 with self.assertRaises(ValueError):
                     model_from_artifact(artifact)
+
+    def test_rejects_evaluation_ratios_impossible_for_integer_counts(self):
+        mutations = (
+            {"accuracy": 0.1},
+            {"coverage": 0.5, "rejection_rate": 0.5},
+            {"accepted_accuracy": 0.123},
+            {
+                "coverage": 0.0,
+                "rejection_rate": 1.0,
+                "accepted_accuracy": 0.1,
+            },
+        )
+        for mutation in mutations:
+            invalid = self._copy_artifact()
+            invalid["evaluation_summary"]["test"].update(mutation)
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(ValueError):
+                    model_from_artifact(invalid)
+
+    def test_accepts_evaluation_ratios_possible_for_integer_counts(self):
+        valid = self._copy_artifact()
+        valid["evaluation_summary"]["test"].update(
+            {
+                "accuracy": 1 / 3,
+                "coverage": 2 / 3,
+                "rejection_rate": 1 / 3,
+                "accepted_accuracy": 0.5,
+            }
+        )
+        model_from_artifact(valid)
+
+        zero_accepted = self._copy_artifact()
+        zero_accepted["evaluation_summary"]["test"].update(
+            {
+                "coverage": 0.0,
+                "rejection_rate": 1.0,
+                "accepted_accuracy": 0.0,
+            }
+        )
+        model_from_artifact(zero_accepted)
 
 
 class IntentClassifierEvaluationTest(unittest.TestCase):
