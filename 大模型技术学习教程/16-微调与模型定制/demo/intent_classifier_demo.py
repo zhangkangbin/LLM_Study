@@ -74,6 +74,15 @@ def validate_examples(
         if not fields_valid:
             continue
 
+        if split == "train" and intent == "unknown":
+            issues.append(
+                _issue(
+                    "unknown_train_label",
+                    "unknown 只允许作为测试期望或预测结果，不能作为训练标签",
+                    [index],
+                )
+            )
+
         normalized = _normalize_for_identity(text)
         if normalized in seen:
             previous_index, previous_intent = seen[normalized]
@@ -147,7 +156,9 @@ def predict_intent(
     confidence_threshold: float = 0.45,
     margin_threshold: float = 0.10,
 ) -> dict[str, object]:
-    features = extract_features(text)
+    features = [
+        feature for feature in extract_features(text) if feature in model.vocabulary
+    ]
     if not features:
         return {
             "intent": "unknown",
@@ -310,7 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_threshold_arguments(evaluate_parser)
 
     predict_parser = subparsers.add_parser("predict", help="训练并预测一条文本")
-    predict_parser.add_argument("--text", required=True)
+    predict_parser.add_argument("--text", required=True, type=_non_blank_text)
     _add_threshold_arguments(predict_parser)
     return parser
 
@@ -363,6 +374,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _add_threshold_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--confidence-threshold", type=float, default=0.45)
     parser.add_argument("--margin-threshold", type=float, default=0.10)
+
+
+def _non_blank_text(value: str) -> str:
+    if not value.strip():
+        raise argparse.ArgumentTypeError("--text 不能为空")
+    return value
 
 
 def _print_json(value: object, stream=None) -> None:

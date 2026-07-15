@@ -2,7 +2,7 @@ import io
 import json
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 
@@ -77,6 +77,15 @@ class IntentDataValidationTest(unittest.TestCase):
         self.assertIn("missing_test_intent", codes)
         self.assertIn("missing_train_intent", codes)
 
+    def test_unknown_is_rejected_in_training_split(self):
+        examples = self.examples + [
+            {"text": "无法识别的训练样本", "intent": "unknown", "split": "train"}
+        ]
+
+        codes = {issue["code"] for issue in validate_examples(examples)}
+
+        self.assertIn("unknown_train_label", codes)
+
 
 class IntentClassifierTrainingTest(unittest.TestCase):
     def setUp(self):
@@ -115,6 +124,18 @@ class IntentClassifierTrainingTest(unittest.TestCase):
             sum(candidate["probability"] for candidate in result["candidates"]),
             1.0,
         )
+
+    def test_out_of_vocabulary_features_are_rejected(self):
+        examples = [
+            {"text": "甲", "intent": "short", "split": "train"},
+            {"text": "乙丙丁戊己庚辛壬癸", "intent": "long", "split": "train"},
+        ]
+        model = train_classifier(examples)
+
+        result = predict_intent(model, "zzzzzzzzzz")
+
+        self.assertEqual(result["intent"], "unknown")
+        self.assertEqual(result["reason"], "no_features")
 
 
 class IntentClassifierEvaluationTest(unittest.TestCase):
@@ -244,6 +265,15 @@ class IntentClassifierCliTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["intent"], "cancel_order")
         self.assertIn("candidates", payload)
+
+    def test_predict_command_rejects_blank_text(self):
+        for text in ("", "   "):
+            with (
+                self.subTest(text=text),
+                redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                main(["--data", str(SAMPLE_DATA), "predict", "--text", text])
 
 
 if __name__ == "__main__":
