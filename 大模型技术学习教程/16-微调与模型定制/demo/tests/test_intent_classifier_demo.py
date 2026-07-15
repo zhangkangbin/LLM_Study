@@ -630,6 +630,7 @@ class IntentClassifierEvaluationTest(unittest.TestCase):
         self.assertEqual(result["count"], 3)
         self.assertAlmostEqual(result["coverage"], 2 / 3)
         self.assertAlmostEqual(result["rejection_rate"], 1 / 3)
+        self.assertEqual(result["rejection_rate"], 1.0 - result["coverage"])
         self.assertEqual(result["accepted_accuracy"], 0.5)
         self.assertEqual(len(result["accepted"]), 2)
         self.assertEqual(len(result["rejected"]), 1)
@@ -651,6 +652,24 @@ class IntentClassifierEvaluationTest(unittest.TestCase):
                 split="train",
                 thresholds=Thresholds(0.0, 0.0, 0.75),
             )
+
+    def test_evaluation_rejects_empty_requested_split(self):
+        model = train_classifier(self.training_examples)
+
+        for split in ("validation", "test"):
+            with (
+                self.subTest(split=split),
+                self.assertRaisesRegex(
+                    ValueError,
+                    rf"^{split} split must not be empty$",
+                ),
+            ):
+                evaluate_classifier(
+                    model,
+                    self.training_examples,
+                    split=split,
+                    thresholds=Thresholds(0.0, 0.0, 0.75),
+                )
 
 
 class IntentClassifierCalibrationTest(unittest.TestCase):

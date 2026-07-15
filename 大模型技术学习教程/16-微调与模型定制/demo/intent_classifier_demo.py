@@ -433,6 +433,9 @@ def evaluate_classifier(
     evaluation_examples = [
         example for example in examples if example.get("split") == split
     ]
+    if not evaluation_examples:
+        raise ValueError(f"{split} split must not be empty")
+
     actual: list[str] = []
     predicted: list[str] = []
     predictions: list[dict[str, object]] = []
@@ -470,10 +473,11 @@ def evaluate_classifier(
 
     metrics = classification_metrics(actual, predicted)
     correctly_accepted = sum(1 for record in accepted if record["correct"])
+    coverage = _safe_divide(len(accepted), len(predictions))
     return {
         **metrics,
-        "rejection_rate": _safe_divide(len(rejected), len(predictions)),
-        "coverage": _safe_divide(len(accepted), len(predictions)),
+        "rejection_rate": 1.0 - coverage,
+        "coverage": coverage,
         "accepted_accuracy": _safe_divide(correctly_accepted, len(accepted)),
         "predictions": predictions,
         "accepted": accepted,
