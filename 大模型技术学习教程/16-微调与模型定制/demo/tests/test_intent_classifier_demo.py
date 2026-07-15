@@ -3,6 +3,8 @@ import hashlib
 import io
 import json
 import math
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1740,6 +1742,26 @@ class IntentSampleDataTest(unittest.TestCase):
         self.assertGreaterEqual(counts["unknown", "validation"], 4)
         self.assertGreaterEqual(counts["unknown", "test"], 4)
 
+    def test_training_vocabulary_contains_ascii_letter_and_digit_features(self):
+        model = train_classifier(load_examples(SAMPLE_DATA))
+        vocabulary = set(model.vocabulary)
+
+        latin_overlap = set(extract_features("ID")) & vocabulary
+        digit_overlap = set(extract_features("2026")) & vocabulary
+        self.assertTrue(
+            any(feature.isascii() and feature.isalpha() for feature in latin_overlap)
+        )
+        self.assertTrue(any(len(feature) == 1 for feature in latin_overlap))
+        self.assertTrue(any(len(feature) == 2 for feature in latin_overlap))
+        self.assertTrue(
+            any(
+                feature.isascii() and any(character.isdigit() for character in feature)
+                for feature in digit_overlap
+            )
+        )
+        self.assertTrue(any(len(feature) == 1 for feature in digit_overlap))
+        self.assertTrue(any(len(feature) == 2 for feature in digit_overlap))
+
     def test_parity_cases_cover_decisions_and_portable_input_shapes(self):
         cases = load_examples(PARITY_CASES)
 
@@ -1878,6 +1900,42 @@ class IntentClassifierCliTest(unittest.TestCase):
             self.assert_single_json_document(stdout)["model_version"], "second"
         )
         self.assertEqual(load_artifact(self.model_path)["model_version"], "second")
+
+    def test_existing_model_is_rejected_before_training_or_calibration(self):
+        self.model_path.write_text("existing model", encoding="utf-8")
+
+        with (
+            patch.object(
+                demo,
+                "train_classifier",
+                wraps=demo.train_classifier,
+            ) as train_spy,
+            patch.object(
+                demo,
+                "calibrate_thresholds",
+                wraps=demo.calibrate_thresholds,
+            ) as calibration_spy,
+        ):
+            exit_code, stdout, stderr = self.invoke(
+                [
+                    "train",
+                    "--data",
+                    str(SAMPLE_DATA),
+                    "--model",
+                    str(self.model_path),
+                    "--model-version",
+                    "must-not-train",
+                ]
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            self.assert_single_json_document(stderr)["error"],
+            "model_exists",
+        )
+        train_spy.assert_not_called()
+        calibration_spy.assert_not_called()
 
     def test_evaluate_loads_artifact_uses_requested_split_and_never_mutates_model(self):
         self.train_model()
@@ -2059,6 +2117,130 @@ class IntentClassifierCliTest(unittest.TestCase):
                 prediction = predict_with_artifact(artifact, case["text"])
                 self.assertEqual(prediction["intent"], case["expected_intent"])
                 self.assertEqual(prediction["reason"], case["expected_reason"])
+
+    def test_ascii_digit_parity_detects_normalization_mutant(self):
+        self.train_model(model_version="normalization-mutant-v1")
+        artifact = load_artifact(self.model_path)
+        statistics = artifact["statistics"]
+        vocabulary = set(statistics["vocabulary"])
+        parity_cases = {
+            case["text"]: case for case in load_examples(PARITY_CASES)
+        }
+        probe_texts = ("ID", "2026", "订单ID2026")
+        self.assertTrue(set(probe_texts).issubset(parity_cases))
+
+        latin_overlap = set(extract_features("ID")) & vocabulary
+        digit_overlap = set(extract_features("2026")) & vocabulary
+        mixed_overlap = set(extract_features("订单ID2026")) & vocabulary
+        self.assertTrue(
+            any(feature.isascii() and feature.isalpha() for feature in latin_overlap)
+        )
+        self.assertTrue(any(len(feature) == 1 for feature in latin_overlap))
+        self.assertTrue(any(len(feature) == 2 for feature in latin_overlap))
+        self.assertTrue(
+            any(any(character.isdigit() for character in feature) for feature in digit_overlap)
+        )
+        self.assertTrue(any(len(feature) == 1 for feature in digit_overlap))
+        self.assertTrue(any(len(feature) == 2 for feature in digit_overlap))
+        self.assertTrue(
+            any(feature.isascii() and feature.isalpha() for feature in mixed_overlap)
+        )
+        self.assertTrue(
+            any(any(character.isdigit() for character in feature) for feature in mixed_overlap)
+        )
+
+        baseline = {
+            text: predict_with_artifact(artifact, text) for text in probe_texts
+        }
+
+        def drop_ascii_letters_and_digits(text):
+            return "".join(
+                character
+                for character in text
+                if not (character.isascii() and character.isalnum())
+            )
+
+        mutant = {
+            text: predict_with_artifact(
+                artifact,
+                drop_ascii_letters_and_digits(text),
+            )
+            for text in probe_texts
+        }
+
+        self.assertTrue(
+            any(baseline[text] != mutant[text] for text in probe_texts)
+        )
+        mutant_mismatches = [
+            text
+            for text in probe_texts
+            if (
+                mutant[text]["intent"],
+                mutant[text]["reason"],
+            )
+            != (
+                parity_cases[text]["expected_intent"],
+                parity_cases[text]["expected_reason"],
+            )
+        ]
+        self.assertTrue(mutant_mismatches)
+
+    def test_real_subprocess_handles_unicode_space_paths_and_utf8_json(self):
+        unicode_directory = (
+            Path(self.temporary_directory.name) / "意图 模型 subprocess"
+        )
+        unicode_directory.mkdir()
+        data_path = unicode_directory / "训练 数据.jsonl"
+        model_path = unicode_directory / "模型 制品.json"
+        data_path.write_bytes(SAMPLE_DATA.read_bytes())
+        environment = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+        train_process = subprocess.run(
+            [
+                sys.executable,
+                str(Path(demo.__file__).resolve()),
+                "train",
+                "--data",
+                str(data_path),
+                "--model",
+                str(model_path),
+                "--model-version",
+                "subprocess-v1",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=environment,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(train_process.returncode, 0, train_process.stderr)
+        self.assertEqual(train_process.stderr, "")
+        train_payload = self.assert_single_json_document(train_process.stdout)
+        self.assertEqual(train_payload["model_version"], "subprocess-v1")
+
+        predict_process = subprocess.run(
+            [
+                sys.executable,
+                str(Path(demo.__file__).resolve()),
+                "predict",
+                "--model",
+                str(model_path),
+                "--text",
+                "ID",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=environment,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(predict_process.returncode, 0, predict_process.stderr)
+        self.assertEqual(predict_process.stderr, "")
+        prediction = self.assert_single_json_document(predict_process.stdout)
+        self.assertEqual(prediction["intent"], "query_order")
+        self.assertEqual(prediction["reason"], "accepted")
 
 
 if __name__ == "__main__":

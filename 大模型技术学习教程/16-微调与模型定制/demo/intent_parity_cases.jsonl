@@ -5,7 +5,7 @@
 {"text":"请","expected_intent":"unknown","expected_reason":"low_confidence"}
 {"text":"处理","expected_intent":"unknown","expected_reason":"low_margin"}
 {"text":"！！！","expected_intent":"unknown","expected_reason":"no_features"}
-{"text":"HELP","expected_intent":"unknown","expected_reason":"no_features"}
-{"text":"2026","expected_intent":"unknown","expected_reason":"no_features"}
+{"text":"ID","expected_intent":"query_order","expected_reason":"accepted"}
+{"text":"2026","expected_intent":"query_order","expected_reason":"accepted"}
 {"text":"退款API","expected_intent":"request_refund","expected_reason":"accepted"}
-{"text":"订单2026","expected_intent":"cancel_order","expected_reason":"accepted"}
+{"text":"订单ID2026","expected_intent":"query_order","expected_reason":"accepted"}

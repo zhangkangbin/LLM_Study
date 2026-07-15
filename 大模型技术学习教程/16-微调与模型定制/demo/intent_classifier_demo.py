@@ -19,7 +19,6 @@ from types import MappingProxyType
 VALID_SPLITS = frozenset({"train", "validation", "test"})
 INTENT_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-DEFAULT_DATA_PATH = Path(__file__).with_name("sample_intents.jsonl")
 SCHEMA_VERSION = 1
 ALGORITHM = "multinomial_naive_bayes"
 REQUIRED_ARTIFACT_KEYS = frozenset(
@@ -1378,6 +1377,11 @@ def _train_cli_artifact(
     model_version: str,
     force: bool,
 ) -> dict[str, object]:
+    if not force and model_path.exists():
+        raise _CliUserError(
+            "model_exists",
+            f"model already exists: {model_path}",
+        )
     examples = _load_valid_cli_examples(data_path)
     try:
         model = train_classifier(examples)
@@ -1421,20 +1425,6 @@ def _inspect_artifact(artifact: Mapping[str, object]) -> dict[str, object]:
         "training_metadata": artifact["training_metadata"],
         "evaluation_summary": artifact["evaluation_summary"],
     }
-
-
-def _add_threshold_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--confidence-threshold", type=_threshold_argument, default=0.45
-    )
-    parser.add_argument("--margin-threshold", type=_threshold_argument, default=0.10)
-
-
-def _threshold_argument(value: str) -> float:
-    try:
-        return _validate_threshold("threshold", float(value))
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def _non_blank_text(value: str) -> str:

@@ -1,4 +1,4 @@
-{"text":"查询订单当前状态","intent":"query_order","split":"train"}
+{"text":"查询订单ID2026的状态","intent":"query_order","split":"train"}
 {"text":"我的订单进展到哪了","intent":"query_order","split":"train"}
 {"text":"帮我查看物流轨迹","intent":"query_order","split":"train"}
 {"text":"包裹预计何时送达","intent":"query_order","split":"train"}
