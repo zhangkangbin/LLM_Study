@@ -1,0 +1,11 @@
+{"text":"查询订单状态","expected_intent":"query_order","expected_reason":"accepted"}
+{"text":"帮我取消订单","expected_intent":"cancel_order","expected_reason":"accepted"}
+{"text":"申请退款","expected_intent":"request_refund","expected_reason":"accepted"}
+{"text":"转人工客服","expected_intent":"human_service","expected_reason":"accepted"}
+{"text":"请","expected_intent":"unknown","expected_reason":"low_confidence"}
+{"text":"处理","expected_intent":"unknown","expected_reason":"low_margin"}
+{"text":"！！！","expected_intent":"unknown","expected_reason":"no_features"}
+{"text":"HELP","expected_intent":"unknown","expected_reason":"no_features"}
+{"text":"2026","expected_intent":"unknown","expected_reason":"no_features"}
+{"text":"退款API","expected_intent":"request_refund","expected_reason":"accepted"}
+{"text":"订单2026","expected_intent":"cancel_order","expected_reason":"accepted"}

@@ -6,6 +6,7 @@ import math
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from collections.abc import Iterator, Mapping
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, asdict
@@ -42,6 +43,7 @@ from intent_classifier_demo import (
 
 
 SAMPLE_DATA = DEMO_DIR / "sample_intents.jsonl"
+PARITY_CASES = DEMO_DIR / "intent_parity_cases.jsonl"
 
 
 class IntentDataValidationTest(unittest.TestCase):
@@ -1714,99 +1716,349 @@ class IntentClassifierCalibrationTest(unittest.TestCase):
                     calibrate_thresholds(model, self.rows, **arguments)
 
 
-class IntentClassifierCliTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.temporary_directory = tempfile.TemporaryDirectory()
-        cls.data_path = Path(cls.temporary_directory.name) / "sample_intents.jsonl"
-        moved_intents = set()
-        rows = []
-        for source_row in load_examples(SAMPLE_DATA):
-            row = dict(source_row)
-            if row["split"] == "train" and row["intent"] not in moved_intents:
-                row["split"] = "validation"
-                moved_intents.add(row["intent"])
-            rows.append(row)
-        cls.data_path.write_text(
-            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
-            encoding="utf-8",
+class IntentSampleDataTest(unittest.TestCase):
+    def test_sample_data_is_balanced_and_passes_the_data_contract(self):
+        rows = load_examples(SAMPLE_DATA)
+
+        self.assertEqual(validate_examples(rows), [])
+        counts = Counter((row["intent"], row["split"]) for row in rows)
+        ordinary_intents = {
+            "query_order",
+            "cancel_order",
+            "request_refund",
+            "human_service",
+        }
+        self.assertEqual(
+            {row["intent"] for row in rows if row["intent"] != "unknown"},
+            ordinary_intents,
+        )
+        for intent in ordinary_intents:
+            with self.subTest(intent=intent):
+                self.assertGreaterEqual(counts[intent, "train"], 6)
+                self.assertGreaterEqual(counts[intent, "validation"], 2)
+                self.assertGreaterEqual(counts[intent, "test"], 2)
+        self.assertGreaterEqual(counts["unknown", "validation"], 4)
+        self.assertGreaterEqual(counts["unknown", "test"], 4)
+
+    def test_parity_cases_cover_decisions_and_portable_input_shapes(self):
+        cases = load_examples(PARITY_CASES)
+
+        self.assertTrue(cases)
+        self.assertTrue(
+            all(
+                set(case)
+                == {"text", "expected_intent", "expected_reason"}
+                for case in cases
+            )
+        )
+        accepted_intents = {
+            case["expected_intent"]
+            for case in cases
+            if case["expected_reason"] == "accepted"
+        }
+        self.assertTrue(
+            {
+                "query_order",
+                "cancel_order",
+                "request_refund",
+                "human_service",
+            }.issubset(accepted_intents)
+        )
+        reasons = {case["expected_reason"] for case in cases}
+        self.assertTrue(
+            {"accepted", "low_confidence", "low_margin", "no_features"}.issubset(
+                reasons
+            )
+        )
+        texts = [case["text"] for case in cases]
+        self.assertTrue(any(text.isascii() and text.isalpha() for text in texts))
+        self.assertTrue(any(any(char.isdigit() for char in text) for text in texts))
+        self.assertTrue(
+            any(
+                any(char.isascii() and char.isalpha() for char in text)
+                and any("\u4e00" <= char <= "\u9fff" for char in text)
+                for text in texts
+            )
         )
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.temporary_directory.cleanup()
 
-    def test_validate_command_returns_json_success(self):
-        with redirect_stdout(io.StringIO()) as output:
-            exit_code = main(["--data", str(self.data_path), "validate"])
+class IntentClassifierCliTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.model_path = Path(self.temporary_directory.name) / "intent-model.json"
 
-        payload = json.loads(output.getvalue())
+    def invoke(self, arguments):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = main(arguments)
+        return exit_code, stdout.getvalue(), stderr.getvalue()
+
+    def assert_single_json_document(self, output):
+        decoder = json.JSONDecoder()
+        payload, end = decoder.raw_decode(output)
+        self.assertEqual(output[end:].strip(), "")
+        return payload
+
+    def train_model(self, *, model_version="test-v1"):
+        exit_code, stdout, stderr = self.invoke(
+            [
+                "train",
+                "--data",
+                str(SAMPLE_DATA),
+                "--model",
+                str(self.model_path),
+                "--model-version",
+                model_version,
+            ]
+        )
+        self.assertEqual(stderr, "")
+        self.assertEqual(exit_code, 0)
+        return self.assert_single_json_document(stdout)
+
+    def test_validate_command_returns_one_json_document(self):
+        exit_code, stdout, stderr = self.invoke(
+            ["validate", "--data", str(SAMPLE_DATA)]
+        )
+
+        payload = self.assert_single_json_document(stdout)
+        self.assertEqual(stderr, "")
         self.assertEqual(exit_code, 0)
         self.assertTrue(payload["valid"])
-        self.assertEqual(payload["count"], 39)
+        self.assertEqual(payload["count"], len(load_examples(SAMPLE_DATA)))
 
-    def test_evaluate_command_returns_metrics(self):
-        with redirect_stdout(io.StringIO()) as output:
-            exit_code = main(["--data", str(self.data_path), "evaluate"])
+    def test_train_writes_a_versioned_artifact_and_json_summary(self):
+        payload = self.train_model(model_version="tutorial-test-v1")
+        artifact = load_artifact(self.model_path)
 
-        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["model"], str(self.model_path))
+        self.assertEqual(payload["model_version"], "tutorial-test-v1")
+        self.assertEqual(payload["schema_version"], SCHEMA_VERSION)
+        self.assertEqual(artifact["model_version"], "tutorial-test-v1")
+        self.assertIn("validation", payload["evaluation_summary"])
+        self.assertIn("test", payload["evaluation_summary"])
+
+    def test_train_refuses_overwrite_without_force_and_force_replaces_it(self):
+        self.train_model(model_version="first")
+        original = self.model_path.read_bytes()
+
+        exit_code, stdout, stderr = self.invoke(
+            [
+                "train",
+                "--data",
+                str(SAMPLE_DATA),
+                "--model",
+                str(self.model_path),
+                "--model-version",
+                "second",
+            ]
+        )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(self.assert_single_json_document(stderr)["error"], "model_exists")
+        self.assertEqual(self.model_path.read_bytes(), original)
+
+        exit_code, stdout, stderr = self.invoke(
+            [
+                "train",
+                "--data",
+                str(SAMPLE_DATA),
+                "--model",
+                str(self.model_path),
+                "--model-version",
+                "second",
+                "--force",
+            ]
+        )
         self.assertEqual(exit_code, 0)
-        self.assertEqual(payload["count"], 15)
-        self.assertIn("confusion_matrix", payload)
-        self.assertIn("macro", payload)
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            self.assert_single_json_document(stdout)["model_version"], "second"
+        )
+        self.assertEqual(load_artifact(self.model_path)["model_version"], "second")
 
-    def test_predict_command_returns_candidates(self):
-        with redirect_stdout(io.StringIO()) as output:
-            exit_code = main(
+    def test_evaluate_loads_artifact_uses_requested_split_and_never_mutates_model(self):
+        self.train_model()
+        original = self.model_path.read_bytes()
+        original_hash = hashlib.sha256(original).hexdigest()
+        original_mtime = self.model_path.stat().st_mtime_ns
+
+        with patch.object(
+            demo,
+            "train_classifier",
+            side_effect=AssertionError("evaluate must not train"),
+        ):
+            exit_code, stdout, stderr = self.invoke(
                 [
+                    "evaluate",
                     "--data",
-                    str(self.data_path),
-                    "predict",
-                    "--text",
-                    "帮我取消订单",
-                    "--confidence-threshold",
-                    "0",
-                    "--margin-threshold",
-                    "0",
+                    str(SAMPLE_DATA),
+                    "--model",
+                    str(self.model_path),
+                    "--split",
+                    "validation",
                 ]
             )
 
-        payload = json.loads(output.getvalue())
+        payload = self.assert_single_json_document(stdout)
         self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(payload["split"], "validation")
+        self.assertEqual(
+            payload["metrics"]["count"],
+            sum(
+                row["split"] == "validation" for row in load_examples(SAMPLE_DATA)
+            ),
+        )
+        current = self.model_path.read_bytes()
+        self.assertEqual(current, original)
+        self.assertEqual(hashlib.sha256(current).hexdigest(), original_hash)
+        self.assertEqual(self.model_path.stat().st_mtime_ns, original_mtime)
+
+    def test_predict_loads_artifact_and_returns_stable_smoke_prediction(self):
+        self.train_model()
+
+        with patch.object(
+            demo,
+            "train_classifier",
+            side_effect=AssertionError("predict must not train"),
+        ):
+            exit_code, stdout, stderr = self.invoke(
+                [
+                    "predict",
+                    "--model",
+                    str(self.model_path),
+                    "--text",
+                    "帮我取消订单",
+                ]
+            )
+
+        payload = self.assert_single_json_document(stdout)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
         self.assertEqual(payload["intent"], "cancel_order")
+        self.assertEqual(payload["reason"], "accepted")
         self.assertIn("candidates", payload)
 
-    def test_predict_command_rejects_blank_text(self):
-        for text in ("", "   "):
-            with (
-                self.subTest(text=text),
-                redirect_stderr(io.StringIO()),
-                self.assertRaises(SystemExit),
-            ):
-                main(["--data", str(SAMPLE_DATA), "predict", "--text", text])
+    def test_inspect_returns_compact_metadata_without_feature_payloads(self):
+        self.train_model()
 
-    def test_cli_rejects_invalid_thresholds(self):
-        for flag in ("--confidence-threshold", "--margin-threshold"):
-            invalid_values = ("-0.01", "1.01", "nan", "inf", "-inf", "1e1000")
-            for invalid_value in invalid_values:
-                with self.subTest(flag=flag, invalid_value=invalid_value):
-                    with (
-                        redirect_stderr(io.StringIO()),
-                        self.assertRaises(SystemExit) as error,
-                    ):
-                        main(
-                            [
-                                "--data",
-                                str(self.data_path),
-                                "predict",
-                                "--text",
-                                "订单",
-                                flag,
-                                invalid_value,
-                            ]
-                        )
+        exit_code, stdout, stderr = self.invoke(
+            ["inspect", "--model", str(self.model_path)]
+        )
 
-                    self.assertEqual(error.exception.code, 2)
+        payload = self.assert_single_json_document(stdout)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(payload["schema_version"], SCHEMA_VERSION)
+        self.assertIn("training_metadata", payload)
+        self.assertIn("evaluation_summary", payload)
+        self.assertEqual(
+            set(payload["statistics"]),
+            {"class_counts", "total_features", "vocabulary_size"},
+        )
+        self.assertNotIn("feature_counts", stdout)
+        self.assertNotIn('"vocabulary"', stdout)
+
+    def test_expected_user_errors_are_json_and_exit_two(self):
+        missing = Path(self.temporary_directory.name) / "missing.jsonl"
+        cases = (
+            (["validate", "--data", str(missing)], "data_load_failed"),
+            (
+                [
+                    "predict",
+                    "--model",
+                    str(self.model_path),
+                    "--text",
+                    "订单",
+                ],
+                "model_load_failed",
+            ),
+        )
+
+        for arguments, expected_error in cases:
+            with self.subTest(arguments=arguments):
+                exit_code, stdout, stderr = self.invoke(arguments)
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(stdout, "")
+                self.assertEqual(
+                    self.assert_single_json_document(stderr)["error"],
+                    expected_error,
+                )
+
+    def test_invalid_dataset_is_a_user_error_with_exit_two(self):
+        invalid_data = Path(self.temporary_directory.name) / "invalid.jsonl"
+        invalid_data.write_text(
+            json.dumps(
+                {"text": "未知训练标签", "intent": "unknown", "split": "train"},
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        exit_code, stdout, stderr = self.invoke(
+            ["validate", "--data", str(invalid_data)]
+        )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stdout, "")
+        payload = self.assert_single_json_document(stderr)
+        self.assertEqual(payload["error"], "invalid_dataset")
+        self.assertTrue(payload["issues"])
+
+    def test_unexpected_failure_is_json_and_exit_one(self):
+        with patch.object(demo, "load_artifact", side_effect=RuntimeError("boom")):
+            exit_code, stdout, stderr = self.invoke(
+                [
+                    "predict",
+                    "--model",
+                    str(self.model_path),
+                    "--text",
+                    "订单",
+                ]
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        payload = self.assert_single_json_document(stderr)
+        self.assertEqual(payload["error"], "unexpected_failure")
+        self.assertEqual(payload["message"], "boom")
+
+    def test_argument_errors_are_structured_and_exit_two(self):
+        for arguments in (
+            ["predict", "--model", str(self.model_path), "--text", "   "],
+            [
+                "evaluate",
+                "--data",
+                str(SAMPLE_DATA),
+                "--model",
+                str(self.model_path),
+                "--split",
+                "train",
+            ],
+        ):
+            with self.subTest(arguments=arguments):
+                stderr = io.StringIO()
+                with redirect_stderr(stderr), self.assertRaises(SystemExit) as error:
+                    main(arguments)
+                self.assertEqual(error.exception.code, 2)
+                self.assertEqual(
+                    self.assert_single_json_document(stderr.getvalue())["error"],
+                    "invalid_arguments",
+                )
+
+    def test_parity_expectations_match_artifact_trained_by_cli(self):
+        self.train_model(model_version="parity-test-v1")
+        artifact = load_artifact(self.model_path)
+
+        for case in load_examples(PARITY_CASES):
+            with self.subTest(text=case["text"]):
+                prediction = predict_with_artifact(artifact, case["text"])
+                self.assertEqual(prediction["intent"], case["expected_intent"])
+                self.assertEqual(prediction["reason"], case["expected_reason"])
 
 
 if __name__ == "__main__":

@@ -1231,69 +1231,196 @@ def _validate_threshold(name: str, value: object) -> float:
     return 0.0 if validated == 0.0 else validated
 
 
+class _JsonArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        _print_json(
+            {"error": "invalid_arguments", "message": message},
+            sys.stderr,
+        )
+        raise SystemExit(2)
+
+
+class _CliUserError(Exception):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        **details: object,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details
+
+    def payload(self) -> dict[str, object]:
+        return {"error": self.code, "message": str(self), **self.details}
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="离线意图识别与分类训练 Demo")
-    parser.add_argument("--data", type=Path, default=DEFAULT_DATA_PATH)
+    parser = _JsonArgumentParser(description="离线意图识别与分类训练 Demo")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("validate", help="校验 JSONL 数据集")
+    validate_parser = subparsers.add_parser("validate", help="校验 JSONL 数据集")
+    validate_parser.add_argument("--data", type=Path, required=True)
 
-    evaluate_parser = subparsers.add_parser("evaluate", help="训练并评估分类器")
-    _add_threshold_arguments(evaluate_parser)
+    train_parser = subparsers.add_parser("train", help="训练并导出模型制品")
+    train_parser.add_argument("--data", type=Path, required=True)
+    train_parser.add_argument("--model", type=Path, required=True)
+    train_parser.add_argument(
+        "--model-version",
+        required=True,
+        type=_non_blank_model_version,
+    )
+    train_parser.add_argument("--force", action="store_true")
 
-    predict_parser = subparsers.add_parser("predict", help="训练并预测一条文本")
+    evaluate_parser = subparsers.add_parser("evaluate", help="加载制品并评估")
+    evaluate_parser.add_argument("--data", type=Path, required=True)
+    evaluate_parser.add_argument("--model", type=Path, required=True)
+    evaluate_parser.add_argument(
+        "--split",
+        choices=("validation", "test"),
+        required=True,
+    )
+
+    predict_parser = subparsers.add_parser("predict", help="加载制品并预测一条文本")
+    predict_parser.add_argument("--model", type=Path, required=True)
     predict_parser.add_argument("--text", required=True, type=_non_blank_text)
-    _add_threshold_arguments(predict_parser)
+
+    inspect_parser = subparsers.add_parser("inspect", help="查看紧凑模型元数据")
+    inspect_parser.add_argument("--model", type=Path, required=True)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        examples = load_examples(args.data)
-    except (OSError, json.JSONDecodeError, ValueError) as error:
-        _print_json({"error": "data_load_failed", "message": str(error)}, sys.stderr)
+        if args.command == "validate":
+            examples = _load_valid_cli_examples(args.data)
+            _print_json({"valid": True, "count": len(examples), "issues": []})
+            return 0
+
+        if args.command == "train":
+            artifact = _train_cli_artifact(
+                data_path=args.data,
+                model_path=args.model,
+                model_version=args.model_version,
+                force=args.force,
+            )
+            _print_json({"model": str(args.model), **_inspect_artifact(artifact)})
+            return 0
+
+        if args.command == "evaluate":
+            examples = _load_valid_cli_examples(args.data)
+            artifact = _load_cli_artifact(args.model)
+            thresholds = _thresholds_from_artifact(artifact)
+            report = evaluate_classifier(
+                model_from_artifact(artifact),
+                examples,
+                split=args.split,
+                thresholds=thresholds,
+            )
+            _print_json(
+                {
+                    "model": str(args.model),
+                    "model_version": artifact["model_version"],
+                    "split": args.split,
+                    "thresholds": dict(artifact["thresholds"]),
+                    "metrics": report,
+                }
+            )
+            return 0
+
+        if args.command == "predict":
+            artifact = _load_cli_artifact(args.model)
+            _print_json(predict_with_artifact(artifact, args.text))
+            return 0
+
+        artifact = _load_cli_artifact(args.model)
+        _print_json(_inspect_artifact(artifact))
+        return 0
+    except _CliUserError as error:
+        _print_json(error.payload(), sys.stderr)
         return 2
+    except Exception as error:
+        _print_json(
+            {"error": "unexpected_failure", "message": str(error)},
+            sys.stderr,
+        )
+        return 1
+
+
+def _load_valid_cli_examples(path: Path) -> list[dict[str, str]]:
+    try:
+        examples = load_examples(path)
+    except (OSError, ValueError) as error:
+        raise _CliUserError("data_load_failed", str(error)) from error
 
     issues = validate_examples(examples)
-    if args.command == "validate":
-        _print_json({"valid": not issues, "count": len(examples), "issues": issues})
-        return 0 if not issues else 1
-
     if issues:
-        _print_json({"error": "invalid_dataset", "issues": issues}, sys.stderr)
-        return 2
+        raise _CliUserError(
+            "invalid_dataset",
+            "dataset validation failed",
+            issues=issues,
+        )
+    return examples
 
+
+def _load_cli_artifact(path: Path) -> dict[str, object]:
+    try:
+        return load_artifact(path)
+    except (OSError, ValueError) as error:
+        raise _CliUserError("model_load_failed", str(error)) from error
+
+
+def _train_cli_artifact(
+    *,
+    data_path: Path,
+    model_path: Path,
+    model_version: str,
+    force: bool,
+) -> dict[str, object]:
+    examples = _load_valid_cli_examples(data_path)
     try:
         model = train_classifier(examples)
-    except ValueError as error:
-        _print_json({"error": "training_failed", "message": str(error)}, sys.stderr)
-        return 2
+        thresholds = calibrate_thresholds(model, examples)
+        artifact = build_artifact(model, thresholds, examples, model_version)
+        save_artifact(artifact, model_path, force=force)
+    except FileExistsError as error:
+        raise _CliUserError("model_exists", str(error)) from error
+    except (OSError, ValueError) as error:
+        raise _CliUserError("training_failed", str(error)) from error
+    return artifact
 
-    if args.command == "evaluate":
-        _print_json(
-            evaluate_classifier(
-                model,
-                examples,
-                split="test",
-                thresholds=Thresholds(
-                    args.confidence_threshold,
-                    args.margin_threshold,
-                    0.75,
-                ),
-            )
-        )
-        return 0
 
-    _print_json(
-        predict_intent(
-            model,
-            args.text,
-            confidence_threshold=args.confidence_threshold,
-            margin_threshold=args.margin_threshold,
-        )
+def _thresholds_from_artifact(artifact: Mapping[str, object]) -> Thresholds:
+    values = artifact["thresholds"]
+    assert isinstance(values, Mapping)
+    return Thresholds(
+        confidence=values["confidence"],
+        margin=values["margin"],
+        minimum_accepted_accuracy=values["minimum_accepted_accuracy"],
     )
-    return 0
+
+
+def _inspect_artifact(artifact: Mapping[str, object]) -> dict[str, object]:
+    statistics = artifact["statistics"]
+    assert isinstance(statistics, Mapping)
+    vocabulary = statistics["vocabulary"]
+    assert isinstance(vocabulary, list)
+    return {
+        "schema_version": artifact["schema_version"],
+        "model_version": artifact["model_version"],
+        "algorithm": artifact["algorithm"],
+        "normalization": artifact["normalization"],
+        "labels": artifact["labels"],
+        "thresholds": artifact["thresholds"],
+        "statistics": {
+            "class_counts": statistics["class_counts"],
+            "total_features": statistics["total_features"],
+            "vocabulary_size": len(vocabulary),
+        },
+        "training_metadata": artifact["training_metadata"],
+        "evaluation_summary": artifact["evaluation_summary"],
+    }
 
 
 def _add_threshold_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1313,6 +1440,12 @@ def _threshold_argument(value: str) -> float:
 def _non_blank_text(value: str) -> str:
     if not value.strip():
         raise argparse.ArgumentTypeError("--text 不能为空")
+    return value
+
+
+def _non_blank_model_version(value: str) -> str:
+    if not value.strip():
+        raise argparse.ArgumentTypeError("--model-version 不能为空")
     return value
 
 
