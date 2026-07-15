@@ -627,6 +627,24 @@ class IntentClassifierArtifactTest(unittest.TestCase):
                 model_version="demo-v1",
             )
 
+    def test_build_rejects_validation_accuracy_below_calibration_floor(self):
+        rows = [
+            {"text": "x", "intent": "a", "split": "train"},
+            {"text": "y", "intent": "b", "split": "train"},
+            {"text": "xx", "intent": "b", "split": "validation"},
+            {"text": "yy", "intent": "b", "split": "validation"},
+            {"text": "xxx", "intent": "a", "split": "test"},
+            {"text": "yyy", "intent": "b", "split": "test"},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "minimum_accepted_accuracy"):
+            build_artifact(
+                train_classifier(rows),
+                Thresholds(0.0, 0.0, 0.75),
+                rows,
+                model_version="below-floor",
+            )
+
     def test_artifact_round_trip_preserves_model_prediction_exactly(self):
         expected = predict_intent(
             self.model,
@@ -849,6 +867,56 @@ class IntentClassifierArtifactTest(unittest.TestCase):
         ):
             model_from_artifact(invalid)
 
+    def test_rejects_features_outside_the_training_contract(self):
+        for replacement in ("abc", "A", "a!"):
+            invalid = self._copy_artifact()
+            statistics = invalid["statistics"]
+            counts = statistics["feature_counts"]["cancel_order"]
+            other_features = set(statistics["feature_counts"]["query_order"])
+            feature = next(value for value in counts if value not in other_features)
+            count = counts.pop(feature)
+            counts[replacement] = count
+            vocabulary = statistics["vocabulary"]
+            vocabulary[vocabulary.index(feature)] = replacement
+            vocabulary.sort()
+
+            with self.subTest(replacement=replacement):
+                with self.assertRaises(ValueError):
+                    model_from_artifact(invalid)
+
+    def test_accepts_reachable_unicode_one_and_two_code_point_features(self):
+        for replacement in ("é", "汉字"):
+            valid = self._copy_artifact()
+            statistics = valid["statistics"]
+            counts = statistics["feature_counts"]["cancel_order"]
+            other_features = set(statistics["feature_counts"]["query_order"])
+            feature = next(value for value in counts if value not in other_features)
+            count = counts.pop(feature)
+            counts[replacement] = count
+            vocabulary = statistics["vocabulary"]
+            vocabulary[vocabulary.index(feature)] = replacement
+            vocabulary.sort()
+
+            with self.subTest(replacement=replacement):
+                model_from_artifact(valid)
+
+    def test_rejects_total_features_below_class_count(self):
+        invalid = self._copy_artifact()
+        statistics = invalid["statistics"]
+        statistics["class_counts"]["cancel_order"] = 2
+        statistics["feature_counts"]["cancel_order"] = {"取": 1}
+        statistics["total_features"]["cancel_order"] = 1
+        feature_union = {
+            feature
+            for counts in statistics["feature_counts"].values()
+            for feature in counts
+        }
+        statistics["vocabulary"] = sorted(feature_union)
+        invalid["training_metadata"]["split_counts"]["train"] = 3
+
+        with self.assertRaises(ValueError):
+            model_from_artifact(invalid)
+
     def test_rejects_invalid_metadata_and_evaluation_summaries(self):
         invalid_artifacts = []
         for timestamp in ("", "2026-07-15", "2026-07-15T08:30:00+08:00"):
@@ -959,6 +1027,53 @@ class IntentClassifierArtifactTest(unittest.TestCase):
             valid["evaluation_summary"]["test"].update(boundary)
             with self.subTest(boundary=boundary):
                 model_from_artifact(valid)
+
+    def test_rejects_validation_accuracy_below_calibration_floor(self):
+        invalid = self._copy_artifact()
+        invalid["evaluation_summary"]["validation"]["accepted_accuracy"] = 0.0
+
+        with self.assertRaisesRegex(ValueError, "minimum_accepted_accuracy"):
+            model_from_artifact(invalid)
+
+    def test_load_rejects_validation_accuracy_below_calibration_floor(self):
+        invalid = self._copy_artifact()
+        invalid["evaluation_summary"]["validation"]["accepted_accuracy"] = 0.0
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "below-floor.json"
+            path.write_text(
+                json.dumps(invalid, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "minimum_accepted_accuracy"):
+                load_artifact(path)
+
+    def test_calibration_floor_accepts_equal_validation_and_ignores_test(self):
+        valid = self._copy_artifact()
+        valid["thresholds"]["minimum_accepted_accuracy"] = 1.0
+        valid["evaluation_summary"]["test"].update(
+            {
+                "accuracy": 1 / 3,
+                "accepted_accuracy": 0.0,
+            }
+        )
+
+        model_from_artifact(valid)
+
+    def test_load_wraps_huge_evaluation_count_overflow_as_field_value_error(self):
+        invalid = self._copy_artifact()
+        huge_count = 10**400
+        invalid["training_metadata"]["split_counts"]["test"] = huge_count
+        invalid["evaluation_summary"]["test"]["count"] = huge_count
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "huge-count.json"
+            path.write_text(json.dumps(invalid), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError,
+                r"evaluation_summary\.test\.accuracy",
+            ):
+                load_artifact(path)
 
 
 class IntentClassifierEvaluationTest(unittest.TestCase):

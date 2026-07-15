@@ -727,8 +727,12 @@ def validate_artifact(artifact: object) -> None:
         root["thresholds"],
         frozenset({"confidence", "margin", "minimum_accepted_accuracy"}),
     )
-    for name in ("confidence", "margin", "minimum_accepted_accuracy"):
+    for name in ("confidence", "margin"):
         _require_artifact_threshold(f"thresholds.{name}", thresholds[name])
+    minimum_accepted_accuracy = _require_artifact_threshold(
+        "thresholds.minimum_accepted_accuracy",
+        thresholds["minimum_accepted_accuracy"],
+    )
 
     statistics = _validate_artifact_statistics(root["statistics"], labels)
     class_counts = statistics["class_counts"]
@@ -737,7 +741,11 @@ def validate_artifact(artifact: object) -> None:
         root["training_metadata"],
         sum(class_counts.values()),
     )
-    _validate_evaluation_summary(root["evaluation_summary"], split_counts)
+    _validate_evaluation_summary(
+        root["evaluation_summary"],
+        split_counts,
+        minimum_accepted_accuracy=minimum_accepted_accuracy,
+    )
 
 
 def _model_from_validated_artifact(
@@ -907,14 +915,18 @@ def _validate_artifact_statistics(
         "statistics.feature_counts", statistics["feature_counts"], label_keys
     )
     for label in labels:
-        _require_count(
+        class_count = _require_count(
             f"statistics.class_counts.{label}",
             class_counts[label],
             minimum=1,
         )
-        _require_count(
+        total_feature_count = _require_count(
             f"statistics.total_features.{label}", total_features[label]
         )
+        if total_feature_count < class_count:
+            raise ValueError(
+                f"statistics.total_features.{label} must be at least class_count"
+            )
 
     feature_union: set[str] = set()
     for label in labels:
@@ -925,6 +937,11 @@ def _validate_artifact_statistics(
         for feature, count in counts.items():
             if not isinstance(feature, str) or not feature.strip():
                 raise ValueError("feature names must be non-blank strings")
+            if not _is_reachable_feature(feature):
+                raise ValueError(
+                    "feature names must be normalized one- or two-code-point "
+                    "n-grams"
+                )
             total += _require_count(
                 f"statistics.feature_counts.{label}.{feature}", count
             )
@@ -938,11 +955,20 @@ def _validate_artifact_statistics(
         for feature in vocabulary
     ):
         raise ValueError("statistics.vocabulary must be a list of non-blank strings")
+    if any(not _is_reachable_feature(feature) for feature in vocabulary):
+        raise ValueError(
+            "statistics.vocabulary entries must be normalized one- or "
+            "two-code-point n-grams"
+        )
     if vocabulary != sorted(vocabulary) or len(vocabulary) != len(set(vocabulary)):
         raise ValueError("statistics.vocabulary must be unique and sorted")
     if set(vocabulary) != feature_union:
         raise ValueError("statistics.vocabulary must match the feature union")
     return statistics
+
+
+def _is_reachable_feature(value: str) -> bool:
+    return len(value) in (1, 2) and normalize_text(value) == value
 
 
 def _validate_training_metadata(
@@ -992,6 +1018,8 @@ def _validate_utc_timestamp(value: object) -> None:
 def _validate_evaluation_summary(
     value: object,
     split_counts: Mapping[str, int],
+    *,
+    minimum_accepted_accuracy: float,
 ) -> None:
     summaries = _require_exact_mapping(
         "evaluation_summary", value, frozenset({"validation", "test"})
@@ -1069,6 +1097,20 @@ def _validate_evaluation_summary(
             raise ValueError(
                 f"evaluation_summary.{split} correct counts are inconsistent"
             )
+        if (
+            split == "validation"
+            and accepted_accuracy < minimum_accepted_accuracy
+            and not math.isclose(
+                accepted_accuracy,
+                minimum_accepted_accuracy,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                "evaluation_summary.validation.accepted_accuracy must satisfy "
+                "thresholds.minimum_accepted_accuracy"
+            )
         macro = _require_exact_mapping(
             f"evaluation_summary.{split}.macro",
             summary["macro"],
@@ -1081,8 +1123,11 @@ def _validate_evaluation_summary(
 
 
 def _ratio_count(name: str, ratio: object, count: int) -> int:
-    scaled = float(ratio) * count
-    nearest = round(scaled)
+    try:
+        scaled = float(ratio) * count
+        nearest = round(scaled)
+    except OverflowError as error:
+        raise ValueError(f"{name} cannot be evaluated for count") from error
     if not math.isclose(scaled, nearest, rel_tol=0.0, abs_tol=1e-9):
         raise ValueError(f"{name} is impossible for count {count}")
     return nearest
