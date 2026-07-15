@@ -1022,7 +1022,7 @@ def _validate_evaluation_summary(
             _require_artifact_threshold(
                 f"evaluation_summary.{split}.{metric}", summary[metric]
             )
-        _ratio_count(
+        total_correct = _ratio_count(
             f"evaluation_summary.{split}.accuracy",
             summary["accuracy"],
             count,
@@ -1049,16 +1049,25 @@ def _validate_evaluation_summary(
             )
         accepted_accuracy = float(summary["accepted_accuracy"])
         if accepted_count == 0:
+            accepted_correct = 0
             if accepted_accuracy != 0.0:
                 raise ValueError(
                     f"evaluation_summary.{split}.accepted_accuracy must be 0 "
                     "when coverage is 0"
                 )
         else:
-            _ratio_count(
+            accepted_correct = _ratio_count(
                 f"evaluation_summary.{split}.accepted_accuracy",
                 accepted_accuracy,
                 accepted_count,
+            )
+        if not (
+            accepted_correct
+            <= total_correct
+            <= accepted_correct + rejected_count
+        ):
+            raise ValueError(
+                f"evaluation_summary.{split} correct counts are inconsistent"
             )
         macro = _require_exact_mapping(
             f"evaluation_summary.{split}.macro",

@@ -917,6 +917,49 @@ class IntentClassifierArtifactTest(unittest.TestCase):
         )
         model_from_artifact(zero_accepted)
 
+    def test_rejects_jointly_impossible_evaluation_counts(self):
+        mutations = (
+            {
+                "accuracy": 0.0,
+                "coverage": 1.0,
+                "rejection_rate": 0.0,
+                "accepted_accuracy": 1.0,
+            },
+            {
+                "accuracy": 1.0,
+                "coverage": 1.0,
+                "rejection_rate": 0.0,
+                "accepted_accuracy": 0.0,
+            },
+        )
+        for mutation in mutations:
+            invalid = self._copy_artifact()
+            invalid["evaluation_summary"]["test"].update(mutation)
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(ValueError):
+                    model_from_artifact(invalid)
+
+    def test_accepts_joint_count_boundaries_with_rejected_predictions(self):
+        boundaries = (
+            {
+                "accuracy": 1 / 3,
+                "coverage": 2 / 3,
+                "rejection_rate": 1 / 3,
+                "accepted_accuracy": 0.5,
+            },
+            {
+                "accuracy": 2 / 3,
+                "coverage": 2 / 3,
+                "rejection_rate": 1 / 3,
+                "accepted_accuracy": 0.5,
+            },
+        )
+        for boundary in boundaries:
+            valid = self._copy_artifact()
+            valid["evaluation_summary"]["test"].update(boundary)
+            with self.subTest(boundary=boundary):
+                model_from_artifact(valid)
+
 
 class IntentClassifierEvaluationTest(unittest.TestCase):
     def setUp(self):
