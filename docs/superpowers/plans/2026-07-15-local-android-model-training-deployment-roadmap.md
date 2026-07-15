@@ -39,4 +39,3 @@ Run the exact full-suite commands in Plan 3. Expected: all lightweight Python, J
 ## Commit strategy
 
 Each task in the child plans ends with a focused commit. Do not squash during implementation; the commits isolate data validation, model math, artifact handling, Java parity, training documentation, local deployment, manifest validation, and Android integration for review.
-
