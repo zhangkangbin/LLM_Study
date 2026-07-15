@@ -285,6 +285,63 @@ class IntentClassifierTrainingTest(unittest.TestCase):
         self.assertEqual(model.class_counts["query_order"], 3)
         self.assertIn("取消", model.vocabulary)
 
+    def test_training_statistics_use_only_train_split(self):
+        examples = [
+            {"text": "取消", "intent": "cancel_order", "split": "train"},
+            {"text": "验证专用词", "intent": "validation_only", "split": "validation"},
+            {"text": "测试专用词", "intent": "test_only", "split": "test"},
+        ]
+
+        model = train_classifier(examples)
+
+        self.assertEqual(model.class_counts, {"cancel_order": 1})
+        self.assertEqual(
+            model.feature_counts["cancel_order"],
+            {"取": 1, "消": 1, "取消": 1},
+        )
+        self.assertEqual(set(model.vocabulary), {"取", "消", "取消"})
+
+    def test_model_data_is_deterministically_ordered(self):
+        model = train_classifier(
+            [
+                {"text": "乙甲", "intent": "zeta", "split": "train"},
+                {"text": "丙甲", "intent": "alpha", "split": "train"},
+            ]
+        )
+
+        self.assertEqual(list(model.class_counts), ["alpha", "zeta"])
+        self.assertEqual(list(model.feature_counts), ["alpha", "zeta"])
+        self.assertEqual(list(model.total_features), ["alpha", "zeta"])
+        for counts in model.feature_counts.values():
+            self.assertEqual(list(counts), sorted(counts))
+        self.assertEqual(model.vocabulary, tuple(sorted(model.vocabulary)))
+
+    def test_model_data_is_deeply_immutable(self):
+        model = train_classifier(
+            [
+                {"text": "乙甲", "intent": "zeta", "split": "train"},
+                {"text": "丙甲", "intent": "alpha", "split": "train"},
+            ]
+        )
+
+        with self.assertRaises(TypeError):
+            model.class_counts["alpha"] = 99
+        with self.assertRaises(TypeError):
+            model.feature_counts["alpha"]["甲"] = 99
+        with self.assertRaises(TypeError):
+            model.total_features["alpha"] = 99
+        with self.assertRaises(TypeError):
+            model.vocabulary[0] = "changed"
+
+    def test_training_rejects_empty_train_split(self):
+        examples = [
+            {"text": "只用于验证", "intent": "example", "split": "validation"},
+            {"text": "只用于测试", "intent": "example", "split": "test"},
+        ]
+
+        with self.assertRaises(ValueError):
+            train_classifier(examples)
+
     def test_trained_classifier_predicts_representative_intent(self):
         model = train_classifier(self.training_examples)
 
@@ -301,6 +358,50 @@ class IntentClassifierTrainingTest(unittest.TestCase):
             sum(candidate["probability"] for candidate in result["candidates"]),
             1.0,
         )
+
+    def test_repeated_features_contribute_their_full_frequency(self):
+        model = train_classifier(
+            [
+                {"text": "x", "intent": "a", "split": "train"},
+                {"text": "y", "intent": "b", "split": "train"},
+            ]
+        )
+
+        result = predict_intent(
+            model,
+            "xxx",
+            confidence_threshold=0.0,
+            margin_threshold=0.0,
+        )
+
+        self.assertEqual(result["intent"], "a")
+        self.assertAlmostEqual(result["candidates"][0]["probability"], 8 / 9)
+
+    def test_tied_candidates_are_ordered_by_intent_and_accepted(self):
+        model = train_classifier(
+            [
+                {"text": "甲乙", "intent": "zeta", "split": "train"},
+                {"text": "甲乙", "intent": "alpha", "split": "train"},
+            ]
+        )
+
+        result = predict_intent(
+            model,
+            "甲乙",
+            confidence_threshold=0.0,
+            margin_threshold=0.0,
+        )
+
+        self.assertEqual(
+            [candidate["intent"] for candidate in result["candidates"]],
+            ["alpha", "zeta"],
+        )
+        self.assertEqual(
+            [candidate["probability"] for candidate in result["candidates"]],
+            [0.5, 0.5],
+        )
+        self.assertEqual(result["intent"], "alpha")
+        self.assertEqual(result["reason"], "accepted")
 
     def test_out_of_vocabulary_features_are_rejected(self):
         examples = [
@@ -358,6 +459,29 @@ class IntentClassifierEvaluationTest(unittest.TestCase):
 
         self.assertEqual(result["intent"], "unknown")
         self.assertEqual(result["reason"], "low_margin")
+
+    def test_prediction_rejects_non_finite_or_out_of_range_thresholds(self):
+        model = train_classifier(self.training_examples)
+
+        for threshold_name in ("confidence_threshold", "margin_threshold"):
+            invalid_values = (
+                -0.01,
+                1.01,
+                float("nan"),
+                float("inf"),
+                float("-inf"),
+            )
+            for invalid_value in invalid_values:
+                with self.subTest(
+                    threshold_name=threshold_name, invalid_value=invalid_value
+                ):
+                    thresholds = {
+                        "confidence_threshold": 0.0,
+                        "margin_threshold": 0.0,
+                        threshold_name: invalid_value,
+                    }
+                    with self.assertRaisesRegex(ValueError, threshold_name):
+                        predict_intent(model, "订单", **thresholds)
 
     def test_confusion_matrix_rows_are_actual_labels(self):
         metrics = classification_metrics(
@@ -472,6 +596,28 @@ class IntentClassifierCliTest(unittest.TestCase):
                 self.assertRaises(SystemExit),
             ):
                 main(["--data", str(SAMPLE_DATA), "predict", "--text", text])
+
+    def test_cli_rejects_invalid_thresholds(self):
+        for flag in ("--confidence-threshold", "--margin-threshold"):
+            for invalid_value in ("-0.01", "1.01", "nan", "inf", "-inf"):
+                with self.subTest(flag=flag, invalid_value=invalid_value):
+                    with (
+                        redirect_stderr(io.StringIO()),
+                        self.assertRaises(SystemExit) as error,
+                    ):
+                        main(
+                            [
+                                "--data",
+                                str(self.data_path),
+                                "predict",
+                                "--text",
+                                "订单",
+                                flag,
+                                invalid_value,
+                            ]
+                        )
+
+                    self.assertEqual(error.exception.code, 2)
 
 
 if __name__ == "__main__":

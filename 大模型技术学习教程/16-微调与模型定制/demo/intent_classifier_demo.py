@@ -9,6 +9,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 
 VALID_SPLITS = frozenset({"train", "validation", "test"})
@@ -18,10 +19,10 @@ DEFAULT_DATA_PATH = Path(__file__).with_name("sample_intents.jsonl")
 
 @dataclass(frozen=True)
 class IntentClassifier:
-    class_counts: dict[str, int]
-    feature_counts: dict[str, dict[str, int]]
-    total_features: dict[str, int]
-    vocabulary: frozenset[str]
+    class_counts: Mapping[str, int]
+    feature_counts: Mapping[str, Mapping[str, int]]
+    total_features: Mapping[str, int]
+    vocabulary: tuple[str, ...]
 
 
 def load_examples(path: Path | str) -> list[dict[str, str]]:
@@ -228,15 +229,28 @@ def train_classifier(examples: Sequence[dict[str, str]]) -> IntentClassifier:
     if not class_counts:
         raise ValueError("训练集不能为空")
 
+    intents = sorted(class_counts)
+    ordered_feature_counts = {
+        intent: MappingProxyType(
+            {
+                feature: feature_counters[intent][feature]
+                for feature in sorted(feature_counters[intent])
+            }
+        )
+        for intent in intents
+    }
     return IntentClassifier(
-        class_counts=dict(class_counts),
-        feature_counts={
-            intent: dict(counts) for intent, counts in feature_counters.items()
-        },
-        total_features={
-            intent: sum(counts.values()) for intent, counts in feature_counters.items()
-        },
-        vocabulary=frozenset(vocabulary),
+        class_counts=MappingProxyType(
+            {intent: class_counts[intent] for intent in intents}
+        ),
+        feature_counts=MappingProxyType(ordered_feature_counts),
+        total_features=MappingProxyType(
+            {
+                intent: sum(ordered_feature_counts[intent].values())
+                for intent in intents
+            }
+        ),
+        vocabulary=tuple(sorted(vocabulary)),
     )
 
 
@@ -247,6 +261,10 @@ def predict_intent(
     confidence_threshold: float = 0.45,
     margin_threshold: float = 0.10,
 ) -> dict[str, object]:
+    confidence_threshold = _validate_threshold(
+        "confidence_threshold", confidence_threshold
+    )
+    margin_threshold = _validate_threshold("margin_threshold", margin_threshold)
     features = [
         feature for feature in extract_features(text) if feature in model.vocabulary
     ]
@@ -287,7 +305,7 @@ def predict_intent(
     confidence = candidates[0]["probability"]
     runner_up = candidates[1]["probability"] if len(candidates) > 1 else 0.0
     predicted_intent = candidates[0]["intent"]
-    reason: str | None = None
+    reason = "accepted"
     if confidence < confidence_threshold:
         predicted_intent = "unknown"
         reason = "low_confidence"
@@ -300,9 +318,8 @@ def predict_intent(
         "confidence": confidence,
         "margin": confidence - runner_up,
         "candidates": candidates,
+        "reason": reason,
     }
-    if reason is not None:
-        result["reason"] = reason
     return result
 
 
@@ -401,6 +418,20 @@ def _safe_divide(numerator: float, denominator: float) -> float:
     return numerator / denominator if denominator else 0.0
 
 
+def _validate_threshold(name: str, value: object) -> float:
+    try:
+        valid = (
+            not isinstance(value, bool)
+            and math.isfinite(value)
+            and 0 <= value <= 1
+        )
+    except TypeError:
+        valid = False
+    if not valid:
+        raise ValueError(f"{name} must be a finite number in [0, 1]")
+    return float(value)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="离线意图识别与分类训练 Demo")
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA_PATH)
@@ -463,8 +494,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _add_threshold_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--confidence-threshold", type=float, default=0.45)
-    parser.add_argument("--margin-threshold", type=float, default=0.10)
+    parser.add_argument(
+        "--confidence-threshold", type=_threshold_argument, default=0.45
+    )
+    parser.add_argument("--margin-threshold", type=_threshold_argument, default=0.10)
+
+
+def _threshold_argument(value: str) -> float:
+    try:
+        return _validate_threshold("threshold", float(value))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def _non_blank_text(value: str) -> str:
