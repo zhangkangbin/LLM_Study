@@ -1,5 +1,6 @@
 import io
 import json
+import math
 import sys
 import tempfile
 import unittest
@@ -333,6 +334,43 @@ class IntentClassifierTrainingTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             model.vocabulary[0] = "changed"
 
+    def test_direct_model_construction_defensively_freezes_caller_data(self):
+        class_counts = {"zeta": 1, "alpha": 2}
+        feature_counts = {
+            "zeta": {"z": 1},
+            "alpha": {"b": 1, "a": 2},
+        }
+        total_features = {"zeta": 1, "alpha": 3}
+        vocabulary = ["z", "b", "a"]
+
+        model = demo.IntentClassifier(
+            class_counts=class_counts,
+            feature_counts=feature_counts,
+            total_features=total_features,
+            vocabulary=vocabulary,
+        )
+        class_counts["alpha"] = 99
+        class_counts["new"] = 1
+        feature_counts["alpha"]["a"] = 99
+        feature_counts["new"] = {"new": 1}
+        total_features["alpha"] = 99
+        vocabulary.append("changed")
+
+        self.assertEqual(list(model.class_counts), ["alpha", "zeta"])
+        self.assertEqual(dict(model.class_counts), {"alpha": 2, "zeta": 1})
+        self.assertEqual(list(model.feature_counts), ["alpha", "zeta"])
+        self.assertEqual(list(model.feature_counts["alpha"]), ["a", "b"])
+        self.assertEqual(dict(model.feature_counts["alpha"]), {"a": 2, "b": 1})
+        self.assertEqual(dict(model.total_features), {"alpha": 3, "zeta": 1})
+        self.assertEqual(model.vocabulary, ("a", "b", "z"))
+
+        with self.assertRaises(TypeError):
+            model.class_counts["alpha"] = 99
+        with self.assertRaises(TypeError):
+            model.feature_counts["alpha"]["a"] = 99
+        with self.assertRaises(TypeError):
+            model.total_features["alpha"] = 99
+
     def test_training_rejects_empty_train_split(self):
         examples = [
             {"text": "只用于验证", "intent": "example", "split": "validation"},
@@ -377,6 +415,27 @@ class IntentClassifierTrainingTest(unittest.TestCase):
         self.assertEqual(result["intent"], "a")
         self.assertAlmostEqual(result["candidates"][0]["probability"], 8 / 9)
 
+    def test_softmax_probabilities_remain_finite_for_long_repeated_input(self):
+        model = train_classifier(
+            [
+                {"text": "x", "intent": "a", "split": "train"},
+                {"text": "y", "intent": "b", "split": "train"},
+            ]
+        )
+
+        result = predict_intent(
+            model,
+            "x" * 20_000,
+            confidence_threshold=0.0,
+            margin_threshold=0.0,
+        )
+        probabilities = [
+            candidate["probability"] for candidate in result["candidates"]
+        ]
+
+        self.assertTrue(all(math.isfinite(value) for value in probabilities))
+        self.assertAlmostEqual(sum(probabilities), 1.0)
+
     def test_tied_candidates_are_ordered_by_intent_and_accepted(self):
         model = train_classifier(
             [
@@ -401,6 +460,41 @@ class IntentClassifierTrainingTest(unittest.TestCase):
             [0.5, 0.5],
         )
         self.assertEqual(result["intent"], "alpha")
+        self.assertEqual(result["reason"], "accepted")
+
+    def test_confidence_equal_to_threshold_is_accepted(self):
+        model = train_classifier(
+            [
+                {"text": "甲乙", "intent": "zeta", "split": "train"},
+                {"text": "甲乙", "intent": "alpha", "split": "train"},
+            ]
+        )
+
+        result = predict_intent(
+            model,
+            "甲乙",
+            confidence_threshold=0.5,
+            margin_threshold=0.0,
+        )
+
+        self.assertEqual(result["confidence"], 0.5)
+        self.assertEqual(result["intent"], "alpha")
+        self.assertEqual(result["reason"], "accepted")
+
+    def test_margin_equal_to_threshold_is_accepted(self):
+        model = train_classifier(
+            [{"text": "甲", "intent": "single", "split": "train"}]
+        )
+
+        result = predict_intent(
+            model,
+            "甲",
+            confidence_threshold=0.0,
+            margin_threshold=1.0,
+        )
+
+        self.assertEqual(result["margin"], 1.0)
+        self.assertEqual(result["intent"], "single")
         self.assertEqual(result["reason"], "accepted")
 
     def test_out_of_vocabulary_features_are_rejected(self):
@@ -470,6 +564,7 @@ class IntentClassifierEvaluationTest(unittest.TestCase):
                 float("nan"),
                 float("inf"),
                 float("-inf"),
+                10**1000,
             )
             for invalid_value in invalid_values:
                 with self.subTest(
@@ -599,7 +694,8 @@ class IntentClassifierCliTest(unittest.TestCase):
 
     def test_cli_rejects_invalid_thresholds(self):
         for flag in ("--confidence-threshold", "--margin-threshold"):
-            for invalid_value in ("-0.01", "1.01", "nan", "inf", "-inf"):
+            invalid_values = ("-0.01", "1.01", "nan", "inf", "-inf", "1e1000")
+            for invalid_value in invalid_values:
                 with self.subTest(flag=flag, invalid_value=invalid_value):
                     with (
                         redirect_stderr(io.StringIO()),

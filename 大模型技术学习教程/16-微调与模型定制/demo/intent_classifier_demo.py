@@ -24,6 +24,35 @@ class IntentClassifier:
     total_features: Mapping[str, int]
     vocabulary: tuple[str, ...]
 
+    def __post_init__(self) -> None:
+        intents = sorted(self.class_counts)
+        class_counts = MappingProxyType(
+            {intent: self.class_counts[intent] for intent in intents}
+        )
+        feature_counts = MappingProxyType(
+            {
+                intent: MappingProxyType(
+                    {
+                        feature: self.feature_counts[intent][feature]
+                        for feature in sorted(self.feature_counts[intent])
+                    }
+                )
+                for intent in sorted(self.feature_counts)
+            }
+        )
+        total_features = MappingProxyType(
+            {
+                intent: self.total_features[intent]
+                for intent in sorted(self.total_features)
+            }
+        )
+        vocabulary = tuple(sorted(set(self.vocabulary)))
+
+        object.__setattr__(self, "class_counts", class_counts)
+        object.__setattr__(self, "feature_counts", feature_counts)
+        object.__setattr__(self, "total_features", total_features)
+        object.__setattr__(self, "vocabulary", vocabulary)
+
 
 def load_examples(path: Path | str) -> list[dict[str, str]]:
     examples: list[dict[str, str]] = []
@@ -229,28 +258,15 @@ def train_classifier(examples: Sequence[dict[str, str]]) -> IntentClassifier:
     if not class_counts:
         raise ValueError("训练集不能为空")
 
-    intents = sorted(class_counts)
-    ordered_feature_counts = {
-        intent: MappingProxyType(
-            {
-                feature: feature_counters[intent][feature]
-                for feature in sorted(feature_counters[intent])
-            }
-        )
-        for intent in intents
-    }
     return IntentClassifier(
-        class_counts=MappingProxyType(
-            {intent: class_counts[intent] for intent in intents}
-        ),
-        feature_counts=MappingProxyType(ordered_feature_counts),
-        total_features=MappingProxyType(
-            {
-                intent: sum(ordered_feature_counts[intent].values())
-                for intent in intents
-            }
-        ),
-        vocabulary=tuple(sorted(vocabulary)),
+        class_counts=dict(class_counts),
+        feature_counts={
+            intent: dict(counts) for intent, counts in feature_counters.items()
+        },
+        total_features={
+            intent: sum(counts.values()) for intent, counts in feature_counters.items()
+        },
+        vocabulary=tuple(vocabulary),
     )
 
 
@@ -425,7 +441,7 @@ def _validate_threshold(name: str, value: object) -> float:
             and math.isfinite(value)
             and 0 <= value <= 1
         )
-    except TypeError:
+    except (TypeError, OverflowError):
         valid = False
     if not valid:
         raise ValueError(f"{name} must be a finite number in [0, 1]")
