@@ -6,12 +6,13 @@ import math
 import re
 import sys
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
 
 
-INTENT_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+VALID_SPLITS = frozenset({"train", "validation", "test"})
+INTENT_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 DEFAULT_DATA_PATH = Path(__file__).with_name("sample_intents.jsonl")
 
 
@@ -31,21 +32,23 @@ def load_examples(path: Path | str) -> list[dict[str, str]]:
                 continue
             value = json.loads(line)
             if not isinstance(value, dict):
-                raise ValueError(f"第 {line_number} 行必须是 JSON 对象")
+                raise ValueError(f"line {line_number}: expected object")
             examples.append(value)
     return examples
 
 
 def validate_examples(
-    examples: Sequence[dict[str, str]],
+    examples: Sequence[Mapping[str, object]],
 ) -> list[dict[str, object]]:
     issues: list[dict[str, object]] = []
-    seen: dict[str, tuple[int, str]] = {}
-    train_intents: set[str] = set()
-    test_intents: set[str] = set()
+    indexed_rows: dict[int, tuple[str, str, str]] = {}
+    exact_text_indexes: dict[str, list[int]] = {}
+    normalized_text_indexes: dict[str, list[int]] = {}
+    split_indexes = {split: [] for split in VALID_SPLITS}
+    ordinary_intent_indexes = {split: {} for split in VALID_SPLITS}
 
     for index, example in enumerate(examples):
-        if not isinstance(example, dict):
+        if not isinstance(example, Mapping):
             issues.append(_issue("invalid_field", "样本必须是对象", [index]))
             continue
 
@@ -61,56 +64,136 @@ def validate_examples(
                 )
                 fields_valid = False
 
-        if isinstance(intent, str) and intent.strip() and not INTENT_PATTERN.fullmatch(intent):
+        if (
+            isinstance(intent, str)
+            and intent.strip()
+            and not INTENT_PATTERN.fullmatch(intent)
+        ):
             issues.append(
                 _issue("invalid_intent", "intent 必须使用小写蛇形命名", [index])
             )
 
-        if isinstance(split, str) and split not in {"train", "test"}:
+        if isinstance(split, str) and split.strip() and split not in VALID_SPLITS:
             issues.append(
-                _issue("invalid_split", "split 只能是 train 或 test", [index])
+                _issue(
+                    "invalid_split",
+                    "split 只能是 train、validation 或 test",
+                    [index],
+                )
+            )
+
+        if split == "train" and intent == "unknown":
+            issues.append(
+                _issue(
+                    "unknown_in_train",
+                    "unknown 是系统拒识标签，不能作为训练标签",
+                    [index],
+                )
             )
 
         if not fields_valid:
             continue
 
-        if split == "train" and intent == "unknown":
+        assert isinstance(text, str)
+        assert isinstance(intent, str)
+        assert isinstance(split, str)
+        normalized = normalize_text(text)
+        normalized_valid = bool(normalized)
+        intent_valid = bool(INTENT_PATTERN.fullmatch(intent))
+        split_valid = split in VALID_SPLITS
+
+        if not normalized_valid:
             issues.append(
                 _issue(
-                    "unknown_train_label",
-                    "unknown 只允许作为测试期望或预测结果，不能作为训练标签",
+                    "empty_normalized_text",
+                    "text 规范化后不能为空",
                     [index],
                 )
             )
 
-        normalized = _normalize_for_identity(text)
-        if normalized in seen:
-            previous_index, previous_intent = seen[normalized]
-            code = "duplicate_text" if previous_intent == intent else "conflicting_label"
-            message = "同一文本重复出现" if code == "duplicate_text" else "同一文本存在冲突标签"
-            issues.append(_issue(code, message, [previous_index, index]))
-        else:
-            seen[normalized] = (index, intent)
+        if not (normalized_valid and intent_valid and split_valid):
+            continue
 
-        if split == "train" and INTENT_PATTERN.fullmatch(intent) and intent != "unknown":
-            train_intents.add(intent)
-        if split == "test" and INTENT_PATTERN.fullmatch(intent) and intent != "unknown":
-            test_intents.add(intent)
+        indexed_rows[index] = (text, intent, split)
+        exact_text_indexes.setdefault(text, []).append(index)
+        normalized_text_indexes.setdefault(normalized, []).append(index)
+        split_indexes[split].append(index)
+        if intent != "unknown":
+            ordinary_intent_indexes[split].setdefault(intent, []).append(index)
 
-    for intent in sorted(train_intents - test_intents):
-        issues.append(
-            _issue("missing_test_intent", f"训练意图 {intent} 没有测试样本")
+    for normalized, indexes in normalized_text_indexes.items():
+        if len(indexes) < 2:
+            continue
+
+        sorted_indexes = sorted(indexes)
+        rows = [indexed_rows[index] for index in sorted_indexes]
+        labels = {intent for _, intent, _ in rows}
+        splits = {split for _, _, split in rows}
+        if len(labels) > 1:
+            issues.append(
+                _issue(
+                    "conflicting_label",
+                    "同一规范化文本存在冲突标签",
+                    sorted_indexes,
+                )
+            )
+        if len(splits) > 1:
+            issues.append(
+                _issue(
+                    "cross_split_leakage",
+                    "同一规范化文本不能跨数据分段出现",
+                    sorted_indexes,
+                )
+            )
+
+        for split in sorted(splits):
+            same_split_indexes = [
+                index
+                for index in sorted_indexes
+                if indexed_rows[index][2] == split
+            ]
+            same_split_labels = {
+                indexed_rows[index][1] for index in same_split_indexes
+            }
+            if len(same_split_indexes) < 2 or len(same_split_labels) != 1:
+                continue
+            has_exact_duplicate = any(
+                len(exact_text_indexes[indexed_rows[index][0]]) > 1
+                for index in same_split_indexes
+            )
+            message = (
+                "同一文本重复出现"
+                if has_exact_duplicate
+                else "规范化后的同一文本重复出现"
+            )
+            issues.append(_issue("duplicate_text", message, same_split_indexes))
+
+    for split in sorted(VALID_SPLITS):
+        if not split_indexes[split]:
+            issues.append(_issue("empty_split", f"{split} 数据分段不能为空", []))
+
+    train_intents = set(ordinary_intent_indexes["train"])
+    evaluation_intents = set(ordinary_intent_indexes["validation"]) | set(
+        ordinary_intent_indexes["test"]
+    )
+    for intent in sorted(evaluation_intents - train_intents):
+        indexes = sorted(
+            ordinary_intent_indexes["validation"].get(intent, [])
+            + ordinary_intent_indexes["test"].get(intent, [])
         )
-    for intent in sorted(test_intents - train_intents):
         issues.append(
-            _issue("missing_train_intent", f"测试意图 {intent} 没有训练样本")
+            _issue(
+                "missing_train_intent",
+                f"验证/测试意图 {intent} 没有训练样本",
+                indexes,
+            )
         )
 
-    return issues
+    return sorted(issues, key=lambda issue: (issue["code"], issue["indexes"]))
 
 
 def normalize_text(text: str) -> str:
-    return _normalize_for_identity(text)
+    return "".join(character for character in text.lower() if character.isalnum())
 
 
 def extract_features(text: str) -> list[str]:
@@ -386,17 +469,8 @@ def _print_json(value: object, stream=None) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2), file=stream)
 
 
-def _normalize_for_identity(text: str) -> str:
-    return "".join(character.lower() for character in text if character.isalnum())
-
-
-def _issue(
-    code: str, message: str, indexes: list[int] | None = None
-) -> dict[str, object]:
-    issue: dict[str, object] = {"code": code, "message": message}
-    if indexes is not None:
-        issue["indexes"] = indexes
-    return issue
+def _issue(code: str, message: str, indexes: list[int]) -> dict[str, object]:
+    return {"code": code, "message": message, "indexes": sorted(indexes)}
 
 
 if __name__ == "__main__":
