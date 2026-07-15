@@ -4,6 +4,7 @@ import io
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,9 @@ from intent_classifier_demo import (
 
 SAMPLE_DATA = DEMO_DIR / "sample_intents.jsonl"
 PARITY_CASES = DEMO_DIR / "intent_parity_cases.jsonl"
+ANDROID_DEMO_DIR = (
+    DEMO_DIR.parents[1] / "17-本地模型与私有化部署" / "demo" / "android"
+)
 
 
 class IntentDataValidationTest(unittest.TestCase):
@@ -1802,6 +1806,216 @@ class IntentSampleDataTest(unittest.TestCase):
                 for text in texts
             )
         )
+
+
+class JavaIntentClassifierParityTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.javac = shutil.which("javac")
+        cls.java = shutil.which("java")
+        if cls.javac is None:
+            raise unittest.SkipTest("javac is not installed or not on PATH")
+        if cls.java is None:
+            raise unittest.SkipTest("java is not installed or not on PATH")
+
+        cls.temporary_directory = tempfile.TemporaryDirectory()
+        temporary_root = Path(cls.temporary_directory.name)
+        cls.classes_directory = temporary_root / "classes"
+        cls.classes_directory.mkdir()
+        unicode_directory = temporary_root / "Java 意图 parity"
+        unicode_directory.mkdir()
+        cls.model_path = unicode_directory / "模型 制品.json"
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = main(
+                [
+                    "train",
+                    "--data",
+                    str(SAMPLE_DATA),
+                    "--model",
+                    str(cls.model_path),
+                    "--model-version",
+                    "java-parity-v1",
+                ]
+            )
+        if exit_code != 0 or stderr.getvalue():
+            raise AssertionError(
+                "temporary parity artifact training failed:\n"
+                f"exit={exit_code}\nstdout={stdout.getvalue()}\n"
+                f"stderr={stderr.getvalue()}"
+            )
+        cls.artifact = load_artifact(cls.model_path)
+
+        java_sources = [
+            ANDROID_DEMO_DIR / "MiniJson.java",
+            ANDROID_DEMO_DIR / "IntentModelLoader.java",
+            ANDROID_DEMO_DIR / "MobileIntentClassifier.java",
+            ANDROID_DEMO_DIR / "MobileIntentClassifierTest.java",
+        ]
+        compile_process = subprocess.run(
+            [
+                cls.javac,
+                "--release",
+                "17",
+                "-Xlint:all",
+                "-encoding",
+                "UTF-8",
+                "-d",
+                str(cls.classes_directory),
+                *(str(path) for path in java_sources),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+            check=False,
+        )
+        if compile_process.returncode != 0:
+            raise AssertionError(
+                "Java intent classifier compilation failed:\n"
+                f"stdout={compile_process.stdout}\n"
+                f"stderr={compile_process.stderr}"
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "temporary_directory"):
+            cls.temporary_directory.cleanup()
+        super().tearDownClass()
+
+    def invoke_java(self, *arguments):
+        return subprocess.run(
+            [
+                self.java,
+                "-cp",
+                str(self.classes_directory),
+                "MobileIntentClassifier",
+                *arguments,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+            check=False,
+        )
+
+    def assert_single_json_document(self, output):
+        decoder = json.JSONDecoder()
+        payload, end = decoder.raw_decode(output)
+        self.assertEqual(output[end:].strip(), "")
+        return payload
+
+    def test_java_test_main_runs_against_python_artifact(self):
+        process = subprocess.run(
+            [
+                self.java,
+                "-cp",
+                str(self.classes_directory),
+                "MobileIntentClassifierTest",
+                str(self.model_path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(process.stderr, "")
+        self.assertEqual(process.stdout.strip(), "MobileIntentClassifierTest OK")
+
+    def test_java_cli_matches_python_for_every_parity_case(self):
+        for case in load_examples(PARITY_CASES):
+            with self.subTest(text=case["text"]):
+                expected = predict_with_artifact(self.artifact, case["text"])
+                process = self.invoke_java(
+                    "--model",
+                    str(self.model_path),
+                    "--text",
+                    case["text"],
+                )
+
+                self.assertEqual(process.returncode, 0, process.stderr)
+                self.assertEqual(process.stderr, "")
+                actual = self.assert_single_json_document(process.stdout)
+                self.assertEqual(actual["intent"], case["expected_intent"])
+                self.assertEqual(actual["reason"], case["expected_reason"])
+                self.assertEqual(actual["intent"], expected["intent"])
+                self.assertEqual(actual["reason"], expected["reason"])
+                self.assertEqual(
+                    [candidate["intent"] for candidate in actual["candidates"]],
+                    [candidate["intent"] for candidate in expected["candidates"]],
+                )
+                self.assertEqual(
+                    len(actual["candidates"]),
+                    len(expected["candidates"]),
+                )
+                for java_candidate, python_candidate in zip(
+                    actual["candidates"], expected["candidates"]
+                ):
+                    self.assertLessEqual(
+                        abs(
+                            java_candidate["probability"]
+                            - python_candidate["probability"]
+                        ),
+                        1e-9,
+                    )
+                self.assertLessEqual(
+                    abs(actual["confidence"] - expected["confidence"]),
+                    1e-9,
+                )
+                self.assertLessEqual(
+                    abs(actual["margin"] - expected["margin"]),
+                    1e-9,
+                )
+
+    def test_java_cli_uses_utf8_unicode_paths_and_structured_exit_two(self):
+        unicode_process = self.invoke_java(
+            "--model",
+            str(self.model_path),
+            "--text",
+            "取消订单",
+        )
+        self.assertEqual(unicode_process.returncode, 0, unicode_process.stderr)
+        self.assertEqual(unicode_process.stderr, "")
+        unicode_payload = self.assert_single_json_document(unicode_process.stdout)
+        unicode_expected = predict_with_artifact(self.artifact, "取消订单")
+        self.assertEqual(unicode_payload["intent"], unicode_expected["intent"])
+        self.assertEqual(unicode_payload["reason"], unicode_expected["reason"])
+
+        missing_model = self.model_path.with_name("不存在 模型.json")
+        invalid_invocations = (
+            ((), "invalid_arguments"),
+            (("--model", str(self.model_path)), "invalid_arguments"),
+            (
+                ("--model", str(missing_model), "--text", "订单"),
+                "model_load_failed",
+            ),
+            (
+                (
+                    "--model",
+                    str(self.model_path),
+                    "--text",
+                    "订单",
+                    "--extra",
+                    "value",
+                ),
+                "invalid_arguments",
+            ),
+        )
+        for arguments, expected_error in invalid_invocations:
+            with self.subTest(arguments=arguments):
+                process = self.invoke_java(*arguments)
+                self.assertEqual(process.returncode, 2)
+                self.assertEqual(process.stdout, "")
+                payload = self.assert_single_json_document(process.stderr)
+                self.assertEqual(payload["error"], expected_error)
+                if expected_error == "model_load_failed":
+                    self.assertIn("不存在 模型.json", payload["message"])
 
 
 class IntentClassifierCliTest(unittest.TestCase):

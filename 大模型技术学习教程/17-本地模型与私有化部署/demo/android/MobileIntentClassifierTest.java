@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public final class MobileIntentClassifierTest {
     private MobileIntentClassifierTest() {}
@@ -21,8 +22,12 @@ public final class MobileIntentClassifierTest {
             testMiniJson();
             testMiniJsonNestingLimits();
             testPythonUnicode151Truth();
+            testPythonNormalizationTruth();
+            testPythonFinalSigmaTruth();
             testPythonAlphanumericCategories();
             testValidArtifact(modelPath);
+            testClassifier(modelPath);
+            testClassifierBoundaries();
             testLoaderResourceLimits(modelPath, temporaryArtifacts);
             testCorruptArtifacts(artifact, temporaryArtifacts);
             System.out.println("MobileIntentClassifierTest OK");
@@ -106,10 +111,18 @@ public final class MobileIntentClassifierTest {
                 "total feature labels"
         );
         require(!model.vocabulary().isEmpty(), "vocabulary");
-        if (model.vocabulary().contains("²") || model.vocabulary().contains("ⅷ")) {
-            require(model.vocabulary().contains("²"), "Python No feature");
-            require(model.vocabulary().contains("ⅷ"), "Python Nl feature");
-            require(model.vocabulary().contains("²ⅷ"), "Python No/Nl bigram feature");
+        if (model.vocabulary().contains("²")) {
+            require(IntentModelLoader.isPythonAlphanumeric('²'), "Python No feature");
+        }
+        if (model.vocabulary().contains("ⅷ")) {
+            require(IntentModelLoader.isPythonAlphanumeric('ⅷ'), "Python Nl feature");
+        }
+        if (model.vocabulary().contains("²ⅷ")) {
+            require(
+                    model.vocabulary().contains("²")
+                            && model.vocabulary().contains("ⅷ"),
+                    "Python No/Nl bigram components"
+            );
         }
         if (Boolean.getBoolean("intent.expect.unicode15_1")) {
             String extensionI = new String(Character.toChars(0x2EBF0));
@@ -124,6 +137,164 @@ public final class MobileIntentClassifierTest {
         expectUnsupported(() -> model.featureCounts().clear());
         expectUnsupported(() -> model.featureCounts().get(firstLabel).clear());
         expectUnsupported(() -> model.vocabulary().clear());
+    }
+
+    private static void testClassifier(Path modelPath) throws IOException {
+        IntentModelLoader.IntentModel model = IntentModelLoader.load(modelPath);
+        MobileIntentClassifier classifier = new MobileIntentClassifier(model);
+
+        MobileIntentClassifier.Prediction accepted = classifier.predict("取消订单");
+        require("cancel_order".equals(accepted.intent()), "cancel_order prediction");
+        require("accepted".equals(accepted.reason()), "accepted prediction reason");
+        require(!accepted.candidates().isEmpty(), "accepted candidates");
+        require(
+                Math.abs(accepted.confidence() - accepted.candidates().get(0).probability())
+                        <= 1e-15,
+                "confidence equals top probability"
+        );
+        double probabilitySum = 0.0;
+        for (int index = 0; index < accepted.candidates().size(); index++) {
+            MobileIntentClassifier.Candidate candidate = accepted.candidates().get(index);
+            probabilitySum += candidate.probability();
+            if (index > 0) {
+                MobileIntentClassifier.Candidate previous = accepted.candidates().get(index - 1);
+                int probabilityOrder = Double.compare(
+                        previous.probability(),
+                        candidate.probability()
+                );
+                require(probabilityOrder >= 0, "candidate probability order");
+                if (probabilityOrder == 0) {
+                    require(
+                            previous.intent().compareTo(candidate.intent()) < 0,
+                            "candidate label tie-break"
+                    );
+                }
+            }
+        }
+        require(Math.abs(probabilitySum - 1.0) <= 1e-9, "candidate probability sum");
+        expectUnsupported(() -> accepted.candidates().clear());
+
+        MobileIntentClassifier.Prediction punctuation = classifier.predict("！！！");
+        require("unknown".equals(punctuation.intent()), "punctuation intent");
+        require("no_features".equals(punctuation.reason()), "punctuation reason");
+        require(punctuation.confidence() == 0.0, "punctuation confidence");
+        require(punctuation.margin() == 0.0, "punctuation margin");
+        require(punctuation.candidates().isEmpty(), "punctuation candidates");
+
+        require("i".equals(MobileIntentClassifier.normalizeText("İ！")), "dotted I lower");
+        require("ος".equals(MobileIntentClassifier.normalizeText("ΟΣ")), "final sigma");
+        require("οσα".equals(MobileIntentClassifier.normalizeText("ΟΣΑ")), "non-final sigma");
+        require("aς".equals(MobileIntentClassifier.normalizeText("A'Σ")), "ignored before sigma");
+        require("aσa".equals(MobileIntentClassifier.normalizeText("AΣ'A")), "ignored after sigma");
+        require("σ".equals(MobileIntentClassifier.normalizeText("'Σ")), "uncased sigma prefix");
+        String deseretUpper = new String(Character.toChars(0x10400));
+        String deseretLower = new String(Character.toChars(0x10428));
+        String extensionI = new String(Character.toChars(0x2EBF0));
+        require(
+                (deseretLower + "²ⅷ" + extensionI).equals(
+                        MobileIntentClassifier.normalizeText(
+                                deseretUpper + "²ⅷ" + extensionI + "\u0378☃"
+                        )
+                ),
+                "fixed supplementary, No, Nl, and Unicode 15.1 normalization"
+        );
+
+        List<String> features = MobileIntentClassifier.extractFeatures("取消！");
+        require(features.equals(List.of("取", "消", "取消")), "unigram and bigram features");
+        expectUnsupported(() -> features.add("其他"));
+        expectIllegalArgument(() -> MobileIntentClassifier.normalizeText(null));
+        expectIllegalArgument(() -> MobileIntentClassifier.extractFeatures(null));
+        expectIllegalArgument(() -> classifier.predict(null));
+        expectIllegalArgument(() -> new MobileIntentClassifier(null));
+    }
+
+    private static void testClassifierBoundaries() {
+        IntentModelLoader.IntentModel tiedModel = syntheticModel(
+                new IntentModelLoader.Thresholds(0.0, 0.0, 0.0),
+                Map.of("alpha", Map.of("x", 1), "beta", Map.of("x", 1)),
+                Map.of("alpha", 1, "beta", 1),
+                Set.of("x")
+        );
+        MobileIntentClassifier.Prediction tied = new MobileIntentClassifier(tiedModel)
+                .predict("x");
+        require("accepted".equals(tied.reason()), "tie accepted at zero thresholds");
+        require("alpha".equals(tied.intent()), "tie predicted label");
+        require(
+                tied.candidates().stream().map(MobileIntentClassifier.Candidate::intent).toList()
+                        .equals(List.of("alpha", "beta")),
+                "tie candidate label order"
+        );
+        require(tied.confidence() == 0.5, "tie confidence");
+        require(tied.margin() == 0.0, "tie margin");
+
+        IntentModelLoader.IntentModel lowConfidenceModel = syntheticModel(
+                new IntentModelLoader.Thresholds(0.6, 0.0, 0.0),
+                Map.of("alpha", Map.of("x", 1), "beta", Map.of("x", 1)),
+                Map.of("alpha", 1, "beta", 1),
+                Set.of("x")
+        );
+        MobileIntentClassifier.Prediction lowConfidence =
+                new MobileIntentClassifier(lowConfidenceModel).predict("x");
+        require("unknown".equals(lowConfidence.intent()), "low confidence intent");
+        require("low_confidence".equals(lowConfidence.reason()), "low confidence reason");
+
+        IntentModelLoader.IntentModel lowMarginModel = syntheticModel(
+                new IntentModelLoader.Thresholds(0.4, 0.1, 0.0),
+                Map.of("alpha", Map.of("x", 1), "beta", Map.of("x", 1)),
+                Map.of("alpha", 1, "beta", 1),
+                Set.of("x")
+        );
+        MobileIntentClassifier.Prediction lowMargin =
+                new MobileIntentClassifier(lowMarginModel).predict("x");
+        require("unknown".equals(lowMargin.intent()), "low margin intent");
+        require("low_margin".equals(lowMargin.reason()), "low margin reason");
+
+        IntentModelLoader.IntentModel frequencyModel = syntheticModel(
+                new IntentModelLoader.Thresholds(0.0, 0.0, 0.0),
+                Map.of(
+                        "alpha", Map.of("x", 2, "y", 1),
+                        "beta", Map.of("x", 1, "y", 2)
+                ),
+                Map.of("alpha", 3, "beta", 3),
+                Set.of("x", "y")
+        );
+        MobileIntentClassifier.Prediction repeated =
+                new MobileIntentClassifier(frequencyModel).predict("xxx");
+        require(
+                Math.abs(repeated.confidence() - 27.0 / 35.0) <= 1e-15,
+                "repeated features contribute full frequency"
+        );
+
+        ArrayList<MobileIntentClassifier.Candidate> mutable = new ArrayList<>();
+        mutable.add(new MobileIntentClassifier.Candidate("alpha", 1.0));
+        MobileIntentClassifier.Prediction copied = new MobileIntentClassifier.Prediction(
+                "alpha",
+                "accepted",
+                1.0,
+                1.0,
+                mutable
+        );
+        mutable.clear();
+        require(copied.candidates().size() == 1, "prediction defensive candidate copy");
+        expectUnsupported(() -> copied.candidates().clear());
+    }
+
+    private static IntentModelLoader.IntentModel syntheticModel(
+            IntentModelLoader.Thresholds thresholds,
+            Map<String, Map<String, Integer>> featureCounts,
+            Map<String, Integer> totalFeatures,
+            Set<String> vocabulary
+    ) {
+        return new IntentModelLoader.IntentModel(
+                1,
+                "synthetic",
+                List.of("alpha", "beta"),
+                thresholds,
+                Map.of("alpha", 1, "beta", 1),
+                featureCounts,
+                totalFeatures,
+                vocabulary
+        );
     }
 
     private static void testMiniJsonNestingLimits() {
@@ -201,6 +372,93 @@ public final class MobileIntentClassifierTest {
                 "Unicode 15.1 lower-stable mismatches=" + lowerMismatches
                         + ", first=" + String.format("U+%04X", firstLowerMismatch)
         );
+    }
+
+    private static void testPythonNormalizationTruth() throws IOException {
+        String truthPath = System.getProperty("intent.normalization.truth");
+        if (truthPath == null) {
+            return;
+        }
+        int codePointCount = Character.MAX_CODE_POINT + 1;
+        byte[] truth = Files.readAllBytes(Path.of(truthPath));
+        require(truth.length == codePointCount * 4, "normalization truth length");
+        int mismatches = 0;
+        int firstMismatch = -1;
+        for (int codePoint = 0; codePoint < codePointCount; codePoint++) {
+            int expected = readBigEndianInt(truth, codePoint * 4);
+            String actual = MobileIntentClassifier.normalizeText(
+                    new String(Character.toChars(codePoint))
+            );
+            int[] actualCodePoints = actual.codePoints().toArray();
+            boolean matches = expected == -1
+                    ? actualCodePoints.length == 0
+                    : actualCodePoints.length == 1 && actualCodePoints[0] == expected;
+            if (!matches) {
+                mismatches++;
+                if (firstMismatch < 0) {
+                    firstMismatch = codePoint;
+                }
+            }
+        }
+        require(
+                mismatches == 0,
+                "normalization mismatches=" + mismatches
+                        + ", first=" + String.format("U+%04X", firstMismatch)
+        );
+    }
+
+    private static void testPythonFinalSigmaTruth() throws IOException {
+        String truthPath = System.getProperty("intent.final_sigma.truth");
+        if (truthPath == null) {
+            return;
+        }
+        int codePointCount = Character.MAX_CODE_POINT + 1;
+        byte[] truth = Files.readAllBytes(Path.of(truthPath));
+        require(truth.length == codePointCount * 4, "Final Sigma truth length");
+        int mismatches = 0;
+        int firstMismatch = -1;
+        for (int codePoint = 0; codePoint < codePointCount; codePoint++) {
+            String probe = new String(Character.toChars(codePoint));
+            int[] actual = {
+                    finalSigmaAtEnd(probe + "Σ"),
+                    finalSigmaAtEnd("A" + probe + "Σ"),
+                    finalSigmaAfterA("AΣ" + probe),
+                    finalSigmaAfterA("AΣ" + probe + "A")
+            };
+            for (int context = 0; context < actual.length; context++) {
+                int expected = truth[codePoint * 4 + context] == 0
+                        ? 0x03C3
+                        : 0x03C2;
+                if (actual[context] != expected) {
+                    mismatches++;
+                    if (firstMismatch < 0) {
+                        firstMismatch = codePoint;
+                    }
+                }
+            }
+        }
+        require(
+                mismatches == 0,
+                "Final Sigma context mismatches=" + mismatches
+                        + ", first=" + String.format("U+%04X", firstMismatch)
+        );
+    }
+
+    private static int finalSigmaAtEnd(String probe) {
+        String normalized = MobileIntentClassifier.normalizeText(probe);
+        return normalized.codePointBefore(normalized.length());
+    }
+
+    private static int finalSigmaAfterA(String probe) {
+        int[] normalized = MobileIntentClassifier.normalizeText(probe).codePoints().toArray();
+        return normalized[1];
+    }
+
+    private static int readBigEndianInt(byte[] source, int offset) {
+        return (source[offset] & 0xFF) << 24
+                | (source[offset + 1] & 0xFF) << 16
+                | (source[offset + 2] & 0xFF) << 8
+                | source[offset + 3] & 0xFF;
     }
 
     private static void testLoaderResourceLimits(
@@ -660,6 +918,17 @@ public final class MobileIntentClassifierTest {
             action.run();
             throw new AssertionError("expected immutable collection");
         } catch (UnsupportedOperationException expected) {
+            // Expected.
+        } catch (Exception error) {
+            throw new AssertionError("unexpected exception", error);
+        }
+    }
+
+    private static void expectIllegalArgument(ThrowingRunnable action) {
+        try {
+            action.run();
+            throw new AssertionError("expected IllegalArgumentException");
+        } catch (IllegalArgumentException expected) {
             // Expected.
         } catch (Exception error) {
             throw new AssertionError("unexpected exception", error);
