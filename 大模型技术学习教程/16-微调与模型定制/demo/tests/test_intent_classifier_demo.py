@@ -7,6 +7,8 @@ DEMO_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(DEMO_DIR))
 
 from intent_classifier_demo import (
+    classification_metrics,
+    evaluate_classifier,
     extract_features,
     predict_intent,
     train_classifier,
@@ -106,6 +108,93 @@ class IntentClassifierTrainingTest(unittest.TestCase):
             sum(candidate["probability"] for candidate in result["candidates"]),
             1.0,
         )
+
+
+class IntentClassifierEvaluationTest(unittest.TestCase):
+    def setUp(self):
+        self.training_examples = [
+            {"text": "取消订单", "intent": "cancel_order", "split": "train"},
+            {"text": "撤销购买", "intent": "cancel_order", "split": "train"},
+            {"text": "查询物流", "intent": "query_order", "split": "train"},
+            {"text": "包裹进度", "intent": "query_order", "split": "train"},
+        ]
+
+    def test_empty_features_are_rejected_as_unknown(self):
+        model = train_classifier(self.training_examples)
+
+        result = predict_intent(model, "!!!")
+
+        self.assertEqual(result["intent"], "unknown")
+        self.assertEqual(result["reason"], "no_features")
+
+    def test_low_confidence_is_rejected_and_preserves_candidates(self):
+        model = train_classifier(self.training_examples)
+
+        result = predict_intent(
+            model,
+            "订单",
+            confidence_threshold=1.0,
+            margin_threshold=0.0,
+        )
+
+        self.assertEqual(result["intent"], "unknown")
+        self.assertEqual(result["reason"], "low_confidence")
+        self.assertGreater(len(result["candidates"]), 0)
+
+    def test_low_margin_is_rejected(self):
+        model = train_classifier(self.training_examples)
+
+        result = predict_intent(
+            model,
+            "订单",
+            confidence_threshold=0.0,
+            margin_threshold=1.0,
+        )
+
+        self.assertEqual(result["intent"], "unknown")
+        self.assertEqual(result["reason"], "low_margin")
+
+    def test_confusion_matrix_rows_are_actual_labels(self):
+        metrics = classification_metrics(
+            actual=["cancel_order", "query_order"],
+            predicted=["query_order", "query_order"],
+        )
+
+        self.assertEqual(
+            metrics["confusion_matrix"]["cancel_order"]["query_order"], 1
+        )
+        self.assertEqual(
+            metrics["confusion_matrix"]["query_order"]["query_order"], 1
+        )
+
+    def test_classification_metrics_handle_zero_denominators(self):
+        metrics = classification_metrics(
+            actual=["cancel_order", "query_order", "query_order"],
+            predicted=["query_order", "query_order", "unknown"],
+        )
+
+        self.assertEqual(metrics["per_intent"]["cancel_order"]["precision"], 0.0)
+        self.assertEqual(metrics["per_intent"]["unknown"]["recall"], 0.0)
+        self.assertAlmostEqual(metrics["per_intent"]["query_order"]["f1"], 0.5)
+        self.assertAlmostEqual(metrics["macro"]["f1"], 1 / 6)
+
+    def test_evaluation_contains_errors_and_metrics(self):
+        model = train_classifier(self.training_examples)
+        test_examples = [
+            {"text": "请取消", "intent": "cancel_order", "split": "test"},
+            {"text": "查一下物流", "intent": "query_order", "split": "test"},
+        ]
+
+        result = evaluate_classifier(
+            model,
+            test_examples,
+            confidence_threshold=1.0,
+            margin_threshold=0.0,
+        )
+
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(len(result["errors"]), 2)
+        self.assertIn("macro", result)
 
 
 if __name__ == "__main__":

@@ -144,8 +144,16 @@ def predict_intent(
     confidence_threshold: float = 0.45,
     margin_threshold: float = 0.10,
 ) -> dict[str, object]:
-    del confidence_threshold, margin_threshold
     features = extract_features(text)
+    if not features:
+        return {
+            "intent": "unknown",
+            "confidence": 0.0,
+            "margin": 0.0,
+            "candidates": [],
+            "reason": "no_features",
+        }
+
     feature_frequency = Counter(features)
     total_examples = sum(model.class_counts.values())
     vocabulary_size = max(1, len(model.vocabulary))
@@ -173,12 +181,119 @@ def predict_intent(
     )
     confidence = candidates[0]["probability"]
     runner_up = candidates[1]["probability"] if len(candidates) > 1 else 0.0
-    return {
-        "intent": candidates[0]["intent"],
+    predicted_intent = candidates[0]["intent"]
+    reason: str | None = None
+    if confidence < confidence_threshold:
+        predicted_intent = "unknown"
+        reason = "low_confidence"
+    elif confidence - runner_up < margin_threshold:
+        predicted_intent = "unknown"
+        reason = "low_margin"
+
+    result: dict[str, object] = {
+        "intent": predicted_intent,
         "confidence": confidence,
         "margin": confidence - runner_up,
         "candidates": candidates,
     }
+    if reason is not None:
+        result["reason"] = reason
+    return result
+
+
+def classification_metrics(
+    actual: Sequence[str], predicted: Sequence[str]
+) -> dict[str, object]:
+    if len(actual) != len(predicted):
+        raise ValueError("actual 和 predicted 长度必须一致")
+
+    labels = sorted(set(actual) | set(predicted))
+    confusion_matrix = {
+        actual_label: {predicted_label: 0 for predicted_label in labels}
+        for actual_label in labels
+    }
+    for actual_label, predicted_label in zip(actual, predicted):
+        confusion_matrix[actual_label][predicted_label] += 1
+
+    per_intent: dict[str, dict[str, float | int]] = {}
+    for label in labels:
+        true_positive = confusion_matrix[label][label]
+        false_positive = sum(
+            confusion_matrix[other][label] for other in labels if other != label
+        )
+        false_negative = sum(
+            confusion_matrix[label][other] for other in labels if other != label
+        )
+        support = sum(confusion_matrix[label].values())
+        precision = _safe_divide(true_positive, true_positive + false_positive)
+        recall = _safe_divide(true_positive, true_positive + false_negative)
+        f1 = _safe_divide(2 * precision * recall, precision + recall)
+        per_intent[label] = {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "support": support,
+        }
+
+    label_count = len(labels)
+    macro = {
+        metric: _safe_divide(
+            sum(float(values[metric]) for values in per_intent.values()), label_count
+        )
+        for metric in ("precision", "recall", "f1")
+    }
+    correct = sum(
+        1 for actual_label, predicted_label in zip(actual, predicted) if actual_label == predicted_label
+    )
+    return {
+        "count": len(actual),
+        "accuracy": _safe_divide(correct, len(actual)),
+        "labels": labels,
+        "confusion_matrix": confusion_matrix,
+        "per_intent": per_intent,
+        "macro": macro,
+    }
+
+
+def evaluate_classifier(
+    model: IntentClassifier,
+    examples: Sequence[dict[str, str]],
+    *,
+    confidence_threshold: float = 0.45,
+    margin_threshold: float = 0.10,
+) -> dict[str, object]:
+    test_examples = [example for example in examples if example.get("split") == "test"]
+    actual: list[str] = []
+    predicted: list[str] = []
+    predictions: list[dict[str, object]] = []
+    errors: list[dict[str, object]] = []
+
+    for example in test_examples:
+        prediction = predict_intent(
+            model,
+            example["text"],
+            confidence_threshold=confidence_threshold,
+            margin_threshold=margin_threshold,
+        )
+        expected_intent = example["intent"]
+        actual.append(expected_intent)
+        predicted_intent = str(prediction["intent"])
+        predicted.append(predicted_intent)
+        record = {
+            "text": example["text"],
+            "expected": expected_intent,
+            **prediction,
+        }
+        predictions.append(record)
+        if predicted_intent != expected_intent:
+            errors.append(record)
+
+    metrics = classification_metrics(actual, predicted)
+    return {**metrics, "predictions": predictions, "errors": errors}
+
+
+def _safe_divide(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else 0.0
 
 
 def _normalize_for_identity(text: str) -> str:
