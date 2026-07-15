@@ -442,6 +442,7 @@ def evaluate_classifier(
     accepted: list[dict[str, object]] = []
     rejected: list[dict[str, object]] = []
     errors: list[dict[str, object]] = []
+    accepted_errors: list[dict[str, object]] = []
 
     for example in evaluation_examples:
         prediction = predict_intent(
@@ -468,8 +469,10 @@ def evaluate_classifier(
             accepted.append(record)
         else:
             rejected.append(record)
-        if is_accepted and not is_correct:
+        if not is_correct:
             errors.append(record)
+        if is_accepted and not is_correct:
+            accepted_errors.append(record)
 
     metrics = classification_metrics(actual, predicted)
     correctly_accepted = sum(1 for record in accepted if record["correct"])
@@ -483,6 +486,7 @@ def evaluate_classifier(
         "accepted": accepted,
         "rejected": rejected,
         "errors": errors,
+        "accepted_errors": accepted_errors,
     }
 
 
@@ -571,7 +575,8 @@ def _validate_threshold(name: str, value: object) -> float:
         valid = False
     if not valid:
         raise ValueError(f"{name} must be a finite number in [0, 1]")
-    return float(value)
+    validated = float(value)
+    return 0.0 if validated == 0.0 else validated
 
 
 def build_parser() -> argparse.ArgumentParser:

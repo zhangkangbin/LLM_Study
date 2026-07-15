@@ -4,8 +4,9 @@ import math
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterator, Mapping
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, asdict
 from decimal import Decimal
 from pathlib import Path
 
@@ -634,13 +635,79 @@ class IntentClassifierEvaluationTest(unittest.TestCase):
         self.assertEqual(result["accepted_accuracy"], 0.5)
         self.assertEqual(len(result["accepted"]), 2)
         self.assertEqual(len(result["rejected"]), 1)
-        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(len(result["errors"]), 2)
+        self.assertEqual(len(result["accepted_errors"]), 1)
         self.assertEqual(result["rejected"][0]["reason"], "no_features")
-        self.assertEqual(result["errors"][0]["reason"], "accepted")
+        self.assertEqual(
+            [row["reason"] for row in result["errors"]],
+            ["accepted", "no_features"],
+        )
+        self.assertEqual(result["accepted_errors"][0]["reason"], "accepted")
         self.assertEqual(
             [row["expected"] for row in result["predictions"]],
             ["a", "b", "b"],
         )
+        self.assertEqual(
+            set(result),
+            {
+                "count",
+                "accuracy",
+                "labels",
+                "confusion_matrix",
+                "per_intent",
+                "macro",
+                "rejection_rate",
+                "coverage",
+                "accepted_accuracy",
+                "predictions",
+                "accepted",
+                "rejected",
+                "errors",
+                "accepted_errors",
+            },
+        )
+        self.assertTrue(
+            all(
+                set(row)
+                == {
+                    "text",
+                    "expected",
+                    "accepted",
+                    "correct",
+                    "intent",
+                    "confidence",
+                    "margin",
+                    "candidates",
+                    "reason",
+                }
+                for row in result["predictions"]
+            )
+        )
+
+    def test_evaluation_with_zero_accepted_predictions_reports_zero_accepted_accuracy(
+        self,
+    ):
+        model = train_classifier(
+            [
+                {"text": "x", "intent": "a", "split": "train"},
+                {"text": "y", "intent": "b", "split": "train"},
+            ]
+        )
+        examples = [{"text": "x", "intent": "a", "split": "test"}]
+
+        result = evaluate_classifier(
+            model,
+            examples,
+            split="test",
+            thresholds=Thresholds(1.0, 0.0, 0.75),
+        )
+
+        self.assertEqual(result["coverage"], 0.0)
+        self.assertEqual(result["rejection_rate"], 1.0)
+        self.assertEqual(result["accepted_accuracy"], 0.0)
+        self.assertEqual(result["accepted"], [])
+        self.assertEqual(result["accepted_errors"], [])
+        self.assertEqual(result["errors"], result["rejected"])
 
     def test_evaluation_rejects_non_evaluation_splits(self):
         model = train_classifier(self.training_examples)
@@ -723,6 +790,13 @@ class IntentClassifierCalibrationTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, field_name):
                     Thresholds(**values)
 
+    def test_thresholds_canonicalize_negative_zero(self):
+        thresholds = Thresholds(-0.0, -0.0, -0.0)
+
+        for value in asdict(thresholds).values():
+            self.assertEqual(math.copysign(1.0, value), 1.0)
+        self.assertNotIn("-0.0", json.dumps(asdict(thresholds), sort_keys=True))
+
     def test_calibration_reads_only_validation_rows(self):
         changed_test = [
             (
@@ -741,21 +815,179 @@ class IntentClassifierCalibrationTest(unittest.TestCase):
 
         self.assertEqual(first, second)
 
+    def test_calibration_never_reads_test_text(self):
+        class PoisonTestRow(Mapping[str, str]):
+            def __init__(self):
+                self.split_reads = 0
+                self.text_reads = 0
+
+            def __getitem__(self, key: str) -> str:
+                if key == "split":
+                    self.split_reads += 1
+                    return "test"
+                if key == "text":
+                    self.text_reads += 1
+                    raise AssertionError("calibration read a test text")
+                if key == "intent":
+                    return "a"
+                raise KeyError(key)
+
+            def __iter__(self) -> Iterator[str]:
+                return iter(("text", "intent", "split"))
+
+            def __len__(self) -> int:
+                return 3
+
+        poison = PoisonTestRow()
+        calibration_rows = [*self.rows[:-1], poison]
+
+        calibrate_thresholds(
+            train_classifier(self.rows),
+            calibration_rows,
+            confidence_values=(0.0,),
+            margin_values=(0.0,),
+            minimum_accepted_accuracy=0.0,
+        )
+
+        self.assertGreater(poison.split_reads, 0)
+        self.assertEqual(poison.text_reads, 0)
+
+    def test_calibration_prefers_higher_macro_f1_over_higher_coverage(self):
+        rows = [
+            {"text": "x", "intent": "a", "split": "train"},
+            {"text": "y", "intent": "b", "split": "train"},
+            {"text": "x", "intent": "a", "split": "validation"},
+            {"text": "y", "intent": "b", "split": "validation"},
+            {"text": "xy", "intent": "unknown", "split": "validation"},
+        ]
+        model = train_classifier(rows)
+        high_coverage = evaluate_classifier(
+            model,
+            rows,
+            split="validation",
+            thresholds=Thresholds(0.0, 0.0, 0.0),
+        )
+        high_macro_f1 = evaluate_classifier(
+            model,
+            rows,
+            split="validation",
+            thresholds=Thresholds(0.6, 0.0, 0.0),
+        )
+
+        self.assertGreater(high_coverage["coverage"], high_macro_f1["coverage"])
+        self.assertGreater(high_macro_f1["macro"]["f1"], high_coverage["macro"]["f1"])
+
+        thresholds = calibrate_thresholds(
+            model,
+            rows,
+            confidence_values=(0.0, 0.6),
+            margin_values=(0.0,),
+            minimum_accepted_accuracy=0.0,
+        )
+
+        self.assertEqual(thresholds, Thresholds(0.6, 0.0, 0.0))
+
+    def test_calibration_prefers_higher_coverage_when_macro_f1_is_equal(self):
+        rows = [
+            {"text": "x", "intent": "a", "split": "train"},
+            {"text": "y", "intent": "b", "split": "train"},
+            {"text": "x", "intent": "b", "split": "validation"},
+        ]
+        model = train_classifier(rows)
+        high_coverage = evaluate_classifier(
+            model,
+            rows,
+            split="validation",
+            thresholds=Thresholds(0.0, 0.0, 0.0),
+        )
+        low_coverage = evaluate_classifier(
+            model,
+            rows,
+            split="validation",
+            thresholds=Thresholds(0.8, 0.0, 0.0),
+        )
+
+        self.assertEqual(high_coverage["macro"]["f1"], low_coverage["macro"]["f1"])
+        self.assertGreater(high_coverage["coverage"], low_coverage["coverage"])
+
+        thresholds = calibrate_thresholds(
+            model,
+            rows,
+            confidence_values=(0.8, 0.0),
+            margin_values=(0.0,),
+            minimum_accepted_accuracy=0.0,
+        )
+
+        self.assertEqual(thresholds, Thresholds(0.0, 0.0, 0.0))
+
+    def test_calibration_keeps_candidate_equal_to_accuracy_floor(self):
+        rows = [
+            {"text": "x", "intent": "a", "split": "train"},
+            {"text": "y", "intent": "b", "split": "train"},
+            {"text": "x", "intent": "a", "split": "validation"},
+            {"text": "y", "intent": "a", "split": "validation"},
+        ]
+
+        thresholds = calibrate_thresholds(
+            train_classifier(rows),
+            rows,
+            confidence_values=(0.0,),
+            margin_values=(0.0,),
+            minimum_accepted_accuracy=0.5,
+        )
+
+        self.assertEqual(thresholds, Thresholds(0.0, 0.0, 0.5))
+
     def test_calibration_breaks_ties_by_lowest_thresholds(self):
         rows = [
             {"text": "x", "intent": "only", "split": "train"},
             {"text": "x", "intent": "only", "split": "validation"},
         ]
 
-        thresholds = calibrate_thresholds(
+        descending = calibrate_thresholds(
             train_classifier(rows),
             rows,
             confidence_values=(0.8, 0.2),
             margin_values=(0.9, 0.1),
             minimum_accepted_accuracy=0.5,
         )
+        ascending = calibrate_thresholds(
+            train_classifier(rows),
+            rows,
+            confidence_values=(0.2, 0.8),
+            margin_values=(0.1, 0.9),
+            minimum_accepted_accuracy=0.5,
+        )
 
-        self.assertEqual(thresholds, Thresholds(0.2, 0.1, 0.5))
+        self.assertEqual(descending, Thresholds(0.2, 0.1, 0.5))
+        self.assertEqual(ascending, descending)
+
+    def test_calibration_canonicalizes_zero_independent_of_grid_order(self):
+        rows = [
+            {"text": "x", "intent": "only", "split": "train"},
+            {"text": "x", "intent": "only", "split": "validation"},
+        ]
+        model = train_classifier(rows)
+
+        negative_first = calibrate_thresholds(
+            model,
+            rows,
+            confidence_values=(-0.0, 0.0),
+            margin_values=(-0.0, 0.0),
+            minimum_accepted_accuracy=-0.0,
+        )
+        positive_first = calibrate_thresholds(
+            model,
+            rows,
+            confidence_values=(0.0, -0.0),
+            margin_values=(0.0, -0.0),
+            minimum_accepted_accuracy=0.0,
+        )
+
+        negative_payload = json.dumps(asdict(negative_first), sort_keys=True)
+        positive_payload = json.dumps(asdict(positive_first), sort_keys=True)
+        self.assertEqual(negative_payload, positive_payload)
+        self.assertNotIn("-0.0", negative_payload)
 
     def test_calibration_fails_when_accuracy_floor_is_unreachable(self):
         rows = [
