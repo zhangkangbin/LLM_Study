@@ -599,6 +599,41 @@ class AdbPlanTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     build_adb_plan(VALID_MANIFEST, local_model=value)
 
+    def test_local_model_rejects_option_drive_and_unicode_control_injection(self):
+        unsafe_names = (
+            "-z",
+            "C:model.gguf",
+            "model\u0080.gguf",
+            "model\u009f.gguf",
+            "model\u202e.gguf",
+            "model\ud800.gguf",
+        )
+        for name in unsafe_names:
+            with self.subTest(name=ascii(name)):
+                manifest = copy.deepcopy(VALID_MANIFEST)
+                manifest["file"]["name"] = name
+                first = None
+                second = None
+                for attempt in range(2):
+                    try:
+                        build_adb_plan(manifest, local_model=name)
+                    except ValueError as error:
+                        if attempt == 0:
+                            first = str(error)
+                        else:
+                            second = str(error)
+                    else:
+                        self.fail(f"unsafe filename accepted: {ascii(name)}")
+                self.assertEqual(first, second)
+
+    def test_safe_unicode_filename_cannot_be_interpreted_as_an_option(self):
+        manifest = copy.deepcopy(VALID_MANIFEST)
+        name = "模型-q4_k_m.gguf"
+        manifest["file"]["name"] = name
+        plan = build_adb_plan(manifest, local_model=name)
+        self.assertEqual(name, plan[1][2])
+        self.assertFalse(plan[1][2].startswith("-"))
+
     def test_remote_directory_must_be_a_safe_child_of_data_local_tmp(self):
         unsafe = (
             "/data/local/tmp",
@@ -619,6 +654,33 @@ class AdbPlanTest(unittest.TestCase):
                         local_model="order-assistant-q4_k_m.gguf",
                         remote_directory=value,
                     )
+
+    def test_remote_directory_rejects_colon_and_unicode_control_or_format(self):
+        unsafe = (
+            "/data/local/tmp/C:model",
+            "/data/local/tmp/model\u0080",
+            "/data/local/tmp/model\u009f",
+            "/data/local/tmp/model\u202e",
+            "/data/local/tmp/model\ud800",
+        )
+        for value in unsafe:
+            with self.subTest(value=ascii(value)):
+                with self.assertRaises(ValueError):
+                    build_adb_plan(
+                        VALID_MANIFEST,
+                        local_model="order-assistant-q4_k_m.gguf",
+                        remote_directory=value,
+                    )
+
+    def test_safe_sibling_remote_directory_still_passes(self):
+        remote = "/data/local/tmp/llama.cpp-v2_模型"
+        plan = build_adb_plan(
+            VALID_MANIFEST,
+            local_model="order-assistant-q4_k_m.gguf",
+            remote_directory=remote,
+        )
+        self.assertEqual(remote, plan[0][-1])
+        self.assertEqual(f"{remote}/order-assistant-q4_k_m.gguf", plan[1][-1])
 
     def test_manifest_file_name_is_also_validated(self):
         for name in ("../order-assistant-q4_k_m.gguf", "model;rm.gguf", "model name.gguf"):
@@ -768,6 +830,31 @@ class ManifestCliTest(unittest.TestCase):
                 self.assertFalse(self.assert_one_json(stderr)["ok"])
                 self.assertNotIn("usage:", stderr)
                 self.assertNotIn("Traceback", stderr)
+
+    def test_help_at_root_and_every_subcommand_is_json_argument_error(self):
+        cases = (
+            ["--help"],
+            ["validate", "--help"],
+            ["verify-file", "--help"],
+            ["preflight", "--help"],
+            ["plan-adb", "--help"],
+        )
+        for argv in cases:
+            with self.subTest(argv=argv):
+                code, stdout, stderr = self.invoke(argv)
+                self.assertEqual(2, code)
+                self.assertEqual("", stdout)
+                self.assertEqual(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "argument_error",
+                            "message": "invalid command arguments",
+                        },
+                    },
+                    self.assert_one_json(stderr),
+                )
+                self.assertNotIn("usage:", stderr)
 
     def test_unexpected_error_is_redacted_and_keyboard_interrupt_is_nonzero(self):
         secret = "top-secret-runtime-detail"

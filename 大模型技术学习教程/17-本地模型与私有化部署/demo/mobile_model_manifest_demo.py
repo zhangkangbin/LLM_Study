@@ -8,6 +8,7 @@ import json
 import posixpath
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -420,6 +421,13 @@ class _CliArgumentError(Exception):
 
 
 class _JsonArgumentParser(argparse.ArgumentParser):
+    def print_help(self, file: object | None = None) -> None:
+        del file
+
+    def exit(self, status: int = 0, message: str | None = None) -> None:
+        del status, message
+        raise _CliArgumentError("invalid command arguments")
+
     def error(self, message: str) -> None:
         del message
         raise _CliArgumentError("invalid command arguments")
@@ -427,7 +435,9 @@ class _JsonArgumentParser(argparse.ArgumentParser):
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = _JsonArgumentParser(prog="mobile_model_manifest_demo.py")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, parser_class=_JsonArgumentParser
+    )
 
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("--manifest", required=True)
@@ -661,7 +671,7 @@ def _sorted_issues(issues: list[dict[str, object]]) -> list[dict[str, object]]:
 
 
 def _contains_control(value: str) -> bool:
-    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+    return any(unicodedata.category(character) in {"Cc", "Cf", "Cs"} for character in value)
 
 
 def _validate_fact_integer(
@@ -683,11 +693,17 @@ def _validate_fact_integer(
 
 
 def _require_safe_filename(value: str, label: str) -> None:
-    if not isinstance(value, str) or not value or value in {".", ".."}:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value in {".", ".."}
+        or value.startswith("-")
+    ):
         raise ValueError(f"{label} is invalid")
     if (
         "/" in value
         or "\\" in value
+        or ":" in value
         or _contains_control(value)
         or any(character.isspace() for character in value)
         or _SHELL_METACHAR_PATTERN.search(value)
@@ -698,7 +714,12 @@ def _require_safe_filename(value: str, label: str) -> None:
 def _normalize_remote_directory(value: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError("remote_directory is invalid")
-    if "\\" in value or _contains_control(value) or any(character.isspace() for character in value):
+    if (
+        "\\" in value
+        or ":" in value
+        or _contains_control(value)
+        or any(character.isspace() for character in value)
+    ):
         raise ValueError("remote_directory is unsafe")
     if _SHELL_METACHAR_PATTERN.search(value):
         raise ValueError("remote_directory contains unsafe characters")
