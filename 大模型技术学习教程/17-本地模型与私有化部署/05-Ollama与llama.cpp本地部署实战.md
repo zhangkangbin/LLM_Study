@@ -49,7 +49,7 @@ if ($LASTEXITCODE -ne 0) { throw '读取已加载模型失败' }
 ollama pull $Model
 if ($LASTEXITCODE -ne 0) { throw "下载模型失败: $Model" }
 
-ollama run $Model
+ollama run $Model --think=false
 if ($LASTEXITCODE -ne 0) { throw "交互推理失败: $Model" }
 ```
 
@@ -67,7 +67,7 @@ $Version | ConvertTo-Json -Depth 4
 
 ## 3. 调用 `/api/generate`
 
-Ollama 的 `/api/generate` 默认返回 NDJSON 流；请求中设置 `"stream": false` 后返回一个 JSON 对象。下列三种客户端都把模型名和 Prompt 当作输入，把生成正文当作输出。
+Ollama 的 `/api/generate` 默认返回 NDJSON 流；请求中设置 `"stream": false` 后返回一个 JSON 对象。当前 Qwen3 示例必须同时设置 `"think": false`，使 Ollama 与训练、合并和 llama.cpp 评测都处于同一非思考模式；这是实验一致性门禁。该布尔开关不是所有模型的通用能力，只按官方 [Thinking](https://docs.ollama.com/capabilities/thinking) 文档用于本章 Qwen3 示例。下列三种客户端都把模型名和 Prompt 当作输入，把生成正文当作输出。
 
 ### 3.1 PowerShell：非流式
 
@@ -80,6 +80,7 @@ $Prompt = '请用一句话说明如何查询订单'
 $Payload = [ordered]@{
     model = $Model
     prompt = $Prompt
+    think = $false
     stream = $false
     options = [ordered]@{ num_ctx = 2048 }
 }
@@ -104,6 +105,7 @@ $Prompt = '请用一句话说明如何查询订单'
 $Payload = [ordered]@{
     model = $Model
     prompt = $Prompt
+    think = $false
     stream = $false
     options = [ordered]@{ num_ctx = 2048 }
 }
@@ -162,6 +164,7 @@ def encode_payload(model: str, prompt: str, stream: bool) -> bytes:
     payload = {
         "model": model,
         "prompt": prompt,
+        "think": False,
         "stream": stream,
         "options": {"num_ctx": 2048},
     }
@@ -316,7 +319,7 @@ if ($LASTEXITCODE -ne 0) { throw '创建 Ollama 模型失败' }
 ollama show --modelfile $CustomModel
 if ($LASTEXITCODE -ne 0) { throw '读取 Modelfile 失败' }
 
-ollama run $CustomModel '请说明查询订单需要哪些信息'
+ollama run $CustomModel --think=false '请说明查询订单需要哪些信息'
 if ($LASTEXITCODE -ne 0) { throw '自定义模型推理失败' }
 ```
 
@@ -337,11 +340,11 @@ ollama create $ImportedModel -f $GgufModelfile
 if ($LASTEXITCODE -ne 0) { throw '导入 GGUF 失败' }
 
 ollama show --modelfile $ImportedModel
-ollama run $ImportedModel '请用一句话说明如何查询订单'
+ollama run $ImportedModel --think=false '请用一句话说明如何查询订单'
 if ($LASTEXITCODE -ne 0) { throw '导入后的 GGUF 推理失败' }
 ```
 
-不要仅凭 `create` 成功判断模板正确。对相同 Prompt 比较 merged、F16 GGUF、Q4 GGUF、Ollama 导入结果，检查角色泄漏、停止符和非思考模式。
+Modelfile 本身不能用一个通用 `PARAMETER` 固定 thinking 开关，因此不要发明该参数；本章在每次 Qwen3 `ollama run` 和 API 请求时显式关闭。不要仅凭 `create` 成功判断模板正确。对相同 Prompt 比较 merged、F16 GGUF、Q4 GGUF、Ollama 导入结果，检查角色泄漏、停止符和非思考模式。
 
 ## 5. Ollama 的网络与安全边界
 
@@ -736,6 +739,7 @@ $ModelSha256
 - [Ollama API Authentication](https://docs.ollama.com/api/authentication)
 - [Ollama Generate API](https://docs.ollama.com/api/generate)
 - [Ollama Streaming](https://docs.ollama.com/api/streaming)
+- [Ollama Thinking](https://docs.ollama.com/capabilities/thinking)
 - [Ollama Modelfile Reference](https://docs.ollama.com/modelfile)
 - [Ollama FAQ](https://docs.ollama.com/faq)
 - [qwen3:0.6b 模型页](https://ollama.com/library/qwen3:0.6b)
