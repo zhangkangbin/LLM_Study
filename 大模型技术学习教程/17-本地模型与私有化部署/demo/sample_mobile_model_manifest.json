@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "example_only": true,
+  "model_id": "order-assistant-0.6b-q4",
+  "runtime": "llama.cpp",
+  "format": "gguf",
+  "quantization": "Q4_K_M",
+  "file": {
+    "name": "order-assistant-q4_k_m.gguf",
+    "size_bytes": 0,
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "context": {
+    "max_context_tokens": 2048,
+    "max_output_tokens": 256
+  },
+  "device_requirements": {
+    "abis": [
+      "arm64-v8a"
+    ],
+    "min_android_api": 28,
+    "min_memory_mb": 3072,
+    "min_free_storage_mb": 1024
+  },
+  "provenance": {
+    "base_model": "Qwen/Qwen3-0.6B",
+    "base_revision": "dddddddddddddddddddddddddddddddddddddddd",
+    "adapter_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "llama_cpp_commit": "cccccccccccccccccccccccccccccccccccccccc"
+  },
+  "licenses": {
+    "model_reviewed": true,
+    "data_reviewed": true
+  },
+  "verification": {
+    "desktop_smoke_tested": false,
+    "device_smoke_tested": false
+  }
+}

@@ -10,6 +10,12 @@
 4. 如何把 Android 和后端接入本地模型网关。
 5. 如何处理隐私、许可证、吞吐和延迟。
 6. 如何运行一个离线本地模型网关决策 Demo。
+7. 如何在 Java/Android 中加载分类模型并验证跨端一致性。
+8. 如何用 Ollama 和 llama.cpp 运行同一个生成模型，通过本地 API 调用，并记录安全边界与可复现基准。
+9. 如何校验模型 manifest，并在加载前完成文件完整性和设备资源预检。
+10. 如何把模型安全地放入 App 私有存储，并设计分阶段激活与回滚。
+11. 如何处理端侧流式输出、生命周期取消和 native 资源释放。
+12. 如何在真实手机上记录加载、生成、取消、内存、温升和耗电证据。
 
 ## 章节目录
 
@@ -17,6 +23,9 @@
 2. [私有化网关、权限与观测](./02-私有化网关权限与观测.md)
 3. [Android 接入与云边协同](./03-Android接入与云边协同.md)
 4. [Demo：本地模型网关决策](./04-Demo-本地模型网关决策.md)
+5. [Ollama 与 llama.cpp 本地部署实战](./05-Ollama与llama.cpp本地部署实战.md)
+6. [意图分类模型部署到 Android](./06-意图分类模型部署到Android.md)
+7. [生成式小模型部署到 Android](./07-生成式小模型部署到Android.md)
 
 ## 架构图
 
@@ -30,6 +39,9 @@ flowchart TD
     Local --> Metrics["监控"]
     Cloud --> Metrics
     Router --> Audit["审计与权限"]
+    ModelManifest["模型 manifest"] --> Preflight["完整性校验 / 资源预检"]
+    Preflight --> AndroidRuntime["Android 端侧运行时"]
+    AndroidRuntime --> Android
 ```
 
 ## 什么时候值得私有化

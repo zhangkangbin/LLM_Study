@@ -1,0 +1,1046 @@
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+public final class MobileIntentClassifierTest {
+    private MobileIntentClassifierTest() {}
+
+    public static void main(String[] args) throws Exception {
+        require(args.length == 1, "expected model path");
+        Path modelPath = Path.of(args[0]);
+        String artifact = Files.readString(modelPath, StandardCharsets.UTF_8);
+        List<Path> temporaryArtifacts = new ArrayList<>();
+
+        try {
+            testMiniJson();
+            testMiniJsonNestingLimits();
+            testPythonUnicode151Truth();
+            testPythonNormalizationBoundaryTruth();
+            testPythonFinalSigmaBoundaryTruth();
+            testPythonNormalizationTruth();
+            testPythonFinalSigmaTruth();
+            testPythonAlphanumericCategories();
+            testValidArtifact(modelPath);
+            testClassifier(modelPath);
+            testClassifierBoundaries();
+            testLoaderResourceLimits(modelPath, temporaryArtifacts);
+            testCorruptArtifacts(artifact, temporaryArtifacts);
+            System.out.println("MobileIntentClassifierTest OK");
+        } finally {
+            for (Path path : temporaryArtifacts) {
+                Files.deleteIfExists(path);
+            }
+        }
+    }
+
+    private static void testMiniJson() {
+        Object parsed = MiniJson.parse(
+                "{\"array\":[null,true,false,-12,3.5,6e2],"
+                        + "\"escaped\":\"line\\nquote\\\"slash\\\\tab\\t\"}"
+        );
+        require(parsed instanceof Map<?, ?>, "JSON object type");
+        Map<?, ?> object = (Map<?, ?>) parsed;
+        require(object.get("array") instanceof List<?>, "JSON array type");
+        List<?> array = (List<?>) object.get("array");
+        require(array.size() == 6, "JSON array size");
+        require(array.get(0) == null, "JSON null");
+        require(Boolean.TRUE.equals(array.get(1)), "JSON true");
+        require(Boolean.FALSE.equals(array.get(2)), "JSON false");
+        require(Long.valueOf(-12).equals(array.get(3)), "JSON integer");
+        require(Double.valueOf(3.5).equals(array.get(4)), "JSON fraction");
+        require(Double.valueOf(600.0).equals(array.get(5)), "JSON exponent");
+        require(
+                "line\nquote\"slash\\tab\t".equals(object.get("escaped")),
+                "JSON escapes"
+        );
+
+        String grinningFace = new String(Character.toChars(0x1F600));
+        require(
+                grinningFace.equals(MiniJson.parse("\"\\uD83D\\uDE00\"")),
+                "escaped surrogate pair"
+        );
+        require(
+                grinningFace.equals(MiniJson.parse("\"" + grinningFace + "\"")),
+                "raw supplementary code point"
+        );
+
+        expectParseError("{\"a\":1,\"a\":2}");
+        expectParseError("true false");
+        expectParseError("\"\\x\"");
+        expectParseError("\"\\u00G0\"");
+        expectParseError("\"control" + String.valueOf((char) 1) + "\"");
+        expectParseError("01");
+        expectParseError("+1");
+        expectParseError("-");
+        expectParseError("1.");
+        expectParseError(".1");
+        expectParseError("1e");
+        expectParseError("1e+");
+        expectParseError("NaN");
+        expectParseError("Infinity");
+        expectParseError("1e309");
+        expectParseError("\"\\u１２３４\"");
+        expectParseError("\"\\uD800\"");
+        expectParseError("\"\\uDC00\"");
+        expectParseError("\"\\uD800x\"");
+    }
+
+    private static void testValidArtifact(Path modelPath) throws IOException {
+        IntentModelLoader.IntentModel model = IntentModelLoader.load(modelPath);
+        require(model.schemaVersion() == 1, "schema version");
+        require(!model.modelVersion().isBlank(), "model version");
+        require(model.labels().contains("cancel_order"), "cancel_order label");
+        require(model.labels().size() >= 2, "multiple labels");
+        require(model.thresholds().confidence() >= 0.0, "confidence threshold");
+        require(model.thresholds().margin() >= 0.0, "margin threshold");
+        require(
+                model.thresholds().minimumAcceptedAccuracy() >= 0.0,
+                "minimum accepted accuracy"
+        );
+        require(
+                model.classCounts().keySet().equals(model.featureCounts().keySet()),
+                "feature count labels"
+        );
+        require(
+                model.classCounts().keySet().equals(model.totalFeatures().keySet()),
+                "total feature labels"
+        );
+        require(!model.vocabulary().isEmpty(), "vocabulary");
+        if (model.vocabulary().contains("²")) {
+            require(IntentModelLoader.isPythonAlphanumeric('²'), "Python No feature");
+        }
+        if (model.vocabulary().contains("ⅷ")) {
+            require(IntentModelLoader.isPythonAlphanumeric('ⅷ'), "Python Nl feature");
+        }
+        if (model.vocabulary().contains("²ⅷ")) {
+            require(
+                    model.vocabulary().contains("²")
+                            && model.vocabulary().contains("ⅷ"),
+                    "Python No/Nl bigram components"
+            );
+        }
+        if (Boolean.getBoolean("intent.expect.unicode15_1")) {
+            String extensionI = new String(Character.toChars(0x2EBF0));
+            require(model.vocabulary().contains(extensionI), "Unicode 15.1 CJK feature");
+            require(model.vocabulary().contains(extensionI + "²"), "Unicode 15.1 CJK bigram");
+        }
+
+        String firstLabel = model.labels().get(0);
+        expectUnsupported(() -> model.labels().add("other"));
+        expectUnsupported(() -> model.classCounts().put(firstLabel, 99));
+        expectUnsupported(() -> model.totalFeatures().clear());
+        expectUnsupported(() -> model.featureCounts().clear());
+        expectUnsupported(() -> model.featureCounts().get(firstLabel).clear());
+        expectUnsupported(() -> model.vocabulary().clear());
+    }
+
+    private static void testClassifier(Path modelPath) throws IOException {
+        IntentModelLoader.IntentModel model = IntentModelLoader.load(modelPath);
+        MobileIntentClassifier classifier = new MobileIntentClassifier(model);
+
+        MobileIntentClassifier.Prediction accepted = classifier.predict("取消订单");
+        require("cancel_order".equals(accepted.intent()), "cancel_order prediction");
+        require("accepted".equals(accepted.reason()), "accepted prediction reason");
+        require(!accepted.candidates().isEmpty(), "accepted candidates");
+        require(
+                Math.abs(accepted.confidence() - accepted.candidates().get(0).probability())
+                        <= 1e-15,
+                "confidence equals top probability"
+        );
+        double probabilitySum = 0.0;
+        for (int index = 0; index < accepted.candidates().size(); index++) {
+            MobileIntentClassifier.Candidate candidate = accepted.candidates().get(index);
+            probabilitySum += candidate.probability();
+            if (index > 0) {
+                MobileIntentClassifier.Candidate previous = accepted.candidates().get(index - 1);
+                int probabilityOrder = Double.compare(
+                        previous.probability(),
+                        candidate.probability()
+                );
+                require(probabilityOrder >= 0, "candidate probability order");
+                if (probabilityOrder == 0) {
+                    require(
+                            previous.intent().compareTo(candidate.intent()) < 0,
+                            "candidate label tie-break"
+                    );
+                }
+            }
+        }
+        require(Math.abs(probabilitySum - 1.0) <= 1e-9, "candidate probability sum");
+        expectUnsupported(() -> accepted.candidates().clear());
+
+        MobileIntentClassifier.Prediction punctuation = classifier.predict("！！！");
+        require("unknown".equals(punctuation.intent()), "punctuation intent");
+        require("no_features".equals(punctuation.reason()), "punctuation reason");
+        require(punctuation.confidence() == 0.0, "punctuation confidence");
+        require(punctuation.margin() == 0.0, "punctuation margin");
+        require(punctuation.candidates().isEmpty(), "punctuation candidates");
+
+        require("i".equals(MobileIntentClassifier.normalizeText("İ！")), "dotted I lower");
+        require("ος".equals(MobileIntentClassifier.normalizeText("ΟΣ")), "final sigma");
+        require("οσα".equals(MobileIntentClassifier.normalizeText("ΟΣΑ")), "non-final sigma");
+        require("aς".equals(MobileIntentClassifier.normalizeText("A'Σ")), "ignored before sigma");
+        require("aσa".equals(MobileIntentClassifier.normalizeText("AΣ'A")), "ignored after sigma");
+        require("σ".equals(MobileIntentClassifier.normalizeText("'Σ")), "uncased sigma prefix");
+        String deseretUpper = new String(Character.toChars(0x10400));
+        String deseretLower = new String(Character.toChars(0x10428));
+        String extensionI = new String(Character.toChars(0x2EBF0));
+        require(
+                (deseretLower + "²ⅷ" + extensionI).equals(
+                        MobileIntentClassifier.normalizeText(
+                                deseretUpper + "²ⅷ" + extensionI + "\u0378☃"
+                        )
+                ),
+                "fixed supplementary, No, Nl, and Unicode 15.1 normalization"
+        );
+
+        List<String> features = MobileIntentClassifier.extractFeatures("取消！");
+        require(features.equals(List.of("取", "消", "取消")), "unigram and bigram features");
+        expectUnsupported(() -> features.add("其他"));
+        expectIllegalArgument(() -> MobileIntentClassifier.normalizeText(null));
+        expectIllegalArgument(() -> MobileIntentClassifier.extractFeatures(null));
+        expectIllegalArgument(() -> classifier.predict(null));
+        expectIllegalArgument(() -> new MobileIntentClassifier(null));
+    }
+
+    private static void testClassifierBoundaries() {
+        IntentModelLoader.IntentModel tiedModel = syntheticModel(
+                new IntentModelLoader.Thresholds(0.0, 0.0, 0.0),
+                Map.of("alpha", Map.of("x", 1), "beta", Map.of("x", 1)),
+                Map.of("alpha", 1, "beta", 1),
+                Set.of("x")
+        );
+        MobileIntentClassifier.Prediction tied = new MobileIntentClassifier(tiedModel)
+                .predict("x");
+        require("accepted".equals(tied.reason()), "tie accepted at zero thresholds");
+        require("alpha".equals(tied.intent()), "tie predicted label");
+        require(
+                tied.candidates().stream().map(MobileIntentClassifier.Candidate::intent).toList()
+                        .equals(List.of("alpha", "beta")),
+                "tie candidate label order"
+        );
+        require(tied.confidence() == 0.5, "tie confidence");
+        require(tied.margin() == 0.0, "tie margin");
+
+        IntentModelLoader.IntentModel lowConfidenceModel = syntheticModel(
+                new IntentModelLoader.Thresholds(0.6, 0.0, 0.0),
+                Map.of("alpha", Map.of("x", 1), "beta", Map.of("x", 1)),
+                Map.of("alpha", 1, "beta", 1),
+                Set.of("x")
+        );
+        MobileIntentClassifier.Prediction lowConfidence =
+                new MobileIntentClassifier(lowConfidenceModel).predict("x");
+        require("unknown".equals(lowConfidence.intent()), "low confidence intent");
+        require("low_confidence".equals(lowConfidence.reason()), "low confidence reason");
+
+        IntentModelLoader.IntentModel lowMarginModel = syntheticModel(
+                new IntentModelLoader.Thresholds(0.4, 0.1, 0.0),
+                Map.of("alpha", Map.of("x", 1), "beta", Map.of("x", 1)),
+                Map.of("alpha", 1, "beta", 1),
+                Set.of("x")
+        );
+        MobileIntentClassifier.Prediction lowMargin =
+                new MobileIntentClassifier(lowMarginModel).predict("x");
+        require("unknown".equals(lowMargin.intent()), "low margin intent");
+        require("low_margin".equals(lowMargin.reason()), "low margin reason");
+
+        IntentModelLoader.IntentModel frequencyModel = syntheticModel(
+                new IntentModelLoader.Thresholds(0.0, 0.0, 0.0),
+                Map.of(
+                        "alpha", Map.of("x", 2, "y", 1),
+                        "beta", Map.of("x", 1, "y", 2)
+                ),
+                Map.of("alpha", 3, "beta", 3),
+                Set.of("x", "y")
+        );
+        MobileIntentClassifier.Prediction repeated =
+                new MobileIntentClassifier(frequencyModel).predict("xxx");
+        require(
+                Math.abs(repeated.confidence() - 27.0 / 35.0) <= 1e-15,
+                "repeated features contribute full frequency"
+        );
+
+        ArrayList<MobileIntentClassifier.Candidate> mutable = new ArrayList<>();
+        mutable.add(new MobileIntentClassifier.Candidate("alpha", 1.0));
+        MobileIntentClassifier.Prediction copied = new MobileIntentClassifier.Prediction(
+                "alpha",
+                "accepted",
+                1.0,
+                1.0,
+                mutable
+        );
+        mutable.clear();
+        require(copied.candidates().size() == 1, "prediction defensive candidate copy");
+        expectUnsupported(() -> copied.candidates().clear());
+    }
+
+    private static IntentModelLoader.IntentModel syntheticModel(
+            IntentModelLoader.Thresholds thresholds,
+            Map<String, Map<String, Integer>> featureCounts,
+            Map<String, Integer> totalFeatures,
+            Set<String> vocabulary
+    ) {
+        return new IntentModelLoader.IntentModel(
+                1,
+                "synthetic",
+                List.of("alpha", "beta"),
+                thresholds,
+                Map.of("alpha", 1, "beta", 1),
+                featureCounts,
+                totalFeatures,
+                vocabulary
+        );
+    }
+
+    private static void testMiniJsonNestingLimits() {
+        require(MiniJson.parse(nestedArray(64)) instanceof List<?>, "depth 64 JSON");
+        require(MiniJson.parse(nestedObject(64)) instanceof Map<?, ?>, "depth 64 object JSON");
+        expectParseError(nestedArray(5000));
+        expectParseError(nestedArray(65));
+        expectParseError(nestedObject(65));
+    }
+
+    private static String nestedArray(int depth) {
+        return "[".repeat(depth) + "0" + "]".repeat(depth);
+    }
+
+    private static String nestedObject(int depth) {
+        return "{\"value\":".repeat(depth) + "0" + "}".repeat(depth);
+    }
+
+    private static void testPythonAlphanumericCategories() {
+        require(Character.getType('²') == Character.OTHER_NUMBER, "No category evidence");
+        require(Character.getType('ⅷ') == Character.LETTER_NUMBER, "Nl category evidence");
+        require(IntentModelLoader.isPythonAlphanumeric('a'), "Python alphabetic character");
+        require(IntentModelLoader.isPythonAlphanumeric('²'), "Python No character");
+        require(IntentModelLoader.isPythonAlphanumeric('ⅷ'), "Python Nl character");
+        require(IntentModelLoader.isPythonAlphanumeric(0x2EBF0), "Unicode 15.1 CJK feature");
+        require(!IntentModelLoader.isPythonAlphanumeric('☃'), "non-alphanumeric symbol");
+        require(IntentModelLoader.isPythonAlphanumeric('A'), "uppercase is alphanumeric");
+        require(IntentModelLoader.isPythonAlphanumeric('İ'), "dotted I is alphanumeric");
+        require(!IntentModelLoader.isPythonAlphanumeric(0x0378), "unassigned is not alphanumeric");
+        require(IntentModelLoader.isPythonLowerStable('a'), "lowercase is lower-stable");
+        require(IntentModelLoader.isPythonLowerStable('²'), "No is lower-stable");
+        require(IntentModelLoader.isPythonLowerStable('ⅷ'), "Nl is lower-stable");
+        require(IntentModelLoader.isPythonLowerStable(0x2EBF0), "Unicode 15.1 CJK is lower-stable");
+        require(!IntentModelLoader.isPythonLowerStable('A'), "uppercase is not lower-stable");
+        require(!IntentModelLoader.isPythonLowerStable('İ'), "dotted I is not lower-stable");
+        require(IntentModelLoader.isPythonLowerStable('☃'), "symbol is lower-stable");
+        require(IntentModelLoader.isPythonLowerStable(0x0378), "unassigned is lower-stable");
+    }
+
+    private static void testPythonUnicode151Truth() throws IOException {
+        String truthPath = System.getProperty("intent.unicode15_1.truth");
+        if (truthPath == null) {
+            return;
+        }
+        int codePointCount = Character.MAX_CODE_POINT + 1;
+        byte[] truth = Files.readAllBytes(Path.of(truthPath));
+        require(truth.length == codePointCount * 2, "Unicode truth table length");
+        int mismatches = 0;
+        int firstMismatch = -1;
+        int lowerMismatches = 0;
+        int firstLowerMismatch = -1;
+        for (int codePoint = 0; codePoint < codePointCount; codePoint++) {
+            boolean expected = truth[codePoint * 2] != 0;
+            if (IntentModelLoader.isPythonAlphanumeric(codePoint) != expected) {
+                mismatches++;
+                if (firstMismatch < 0) {
+                    firstMismatch = codePoint;
+                }
+            }
+            boolean expectedLowerStable = truth[codePoint * 2 + 1] != 0;
+            if (IntentModelLoader.isPythonLowerStable(codePoint) != expectedLowerStable) {
+                lowerMismatches++;
+                if (firstLowerMismatch < 0) {
+                    firstLowerMismatch = codePoint;
+                }
+            }
+        }
+        require(
+                mismatches == 0,
+                "Unicode 15.1 alnum mismatches=" + mismatches
+                        + ", first=" + String.format("U+%04X", firstMismatch)
+        );
+        require(
+                lowerMismatches == 0,
+                "Unicode 15.1 lower-stable mismatches=" + lowerMismatches
+                        + ", first=" + String.format("U+%04X", firstLowerMismatch)
+        );
+    }
+
+    private static void testPythonNormalizationTruth() throws IOException {
+        String truthPath = System.getProperty("intent.normalization.truth");
+        if (truthPath == null) {
+            return;
+        }
+        int codePointCount = Character.MAX_CODE_POINT + 1;
+        byte[] truth = Files.readAllBytes(Path.of(truthPath));
+        require(truth.length == codePointCount * 4, "normalization truth length");
+        int mismatches = 0;
+        int firstMismatch = -1;
+        for (int codePoint = 0; codePoint < codePointCount; codePoint++) {
+            int expected = readBigEndianInt(truth, codePoint * 4);
+            String actual = MobileIntentClassifier.normalizeText(
+                    new String(Character.toChars(codePoint))
+            );
+            int[] actualCodePoints = actual.codePoints().toArray();
+            boolean matches = expected == -1
+                    ? actualCodePoints.length == 0
+                    : actualCodePoints.length == 1 && actualCodePoints[0] == expected;
+            if (!matches) {
+                mismatches++;
+                if (firstMismatch < 0) {
+                    firstMismatch = codePoint;
+                }
+            }
+        }
+        require(
+                mismatches == 0,
+                "normalization mismatches=" + mismatches
+                        + ", first=" + String.format("U+%04X", firstMismatch)
+        );
+    }
+
+    private static void testPythonNormalizationBoundaryTruth() throws IOException {
+        String truthPath = System.getProperty("intent.normalization.boundary.truth");
+        if (truthPath == null) {
+            return;
+        }
+        byte[] truth = Files.readAllBytes(Path.of(truthPath));
+        require(truth.length >= 4, "normalization boundary truth length");
+        int count = readBigEndianInt(truth, 0);
+        require(
+                count >= 0 && truth.length == 4L + (long) count * 8L,
+                "normalization boundary truth length"
+        );
+        int mismatches = 0;
+        int firstMismatch = -1;
+        int previousCodePoint = -1;
+        for (int index = 0; index < count; index++) {
+            int offset = 4 + index * 8;
+            int codePoint = readBigEndianInt(truth, offset);
+            int expected = readBigEndianInt(truth, offset + 4);
+            require(
+                    codePoint > previousCodePoint
+                            && Character.isValidCodePoint(codePoint),
+                    "normalization boundary truth codepoint order"
+            );
+            previousCodePoint = codePoint;
+            String actual = MobileIntentClassifier.normalizeText(
+                    new String(Character.toChars(codePoint))
+            );
+            int[] actualCodePoints = actual.codePoints().toArray();
+            boolean matches = expected == -1
+                    ? actualCodePoints.length == 0
+                    : actualCodePoints.length == 1 && actualCodePoints[0] == expected;
+            if (!matches) {
+                mismatches++;
+                if (firstMismatch < 0) {
+                    firstMismatch = codePoint;
+                }
+            }
+        }
+        require(
+                mismatches == 0,
+                "normalization boundary mismatches=" + mismatches
+                        + ", first=" + String.format("U+%04X", firstMismatch)
+        );
+    }
+
+    private static void testPythonFinalSigmaBoundaryTruth() throws IOException {
+        String truthPath = System.getProperty("intent.final_sigma.boundary.truth");
+        if (truthPath == null) {
+            return;
+        }
+        byte[] truth = Files.readAllBytes(Path.of(truthPath));
+        require(truth.length >= 4, "Final Sigma boundary truth length");
+        int count = readBigEndianInt(truth, 0);
+        require(
+                count >= 0 && truth.length == 4L + (long) count * 8L,
+                "Final Sigma boundary truth length"
+        );
+        int mismatches = 0;
+        int firstMismatch = -1;
+        int previousCodePoint = -1;
+        for (int index = 0; index < count; index++) {
+            int offset = 4 + index * 8;
+            int codePoint = readBigEndianInt(truth, offset);
+            require(
+                    codePoint > previousCodePoint
+                            && Character.isValidCodePoint(codePoint),
+                    "Final Sigma boundary truth codepoint order"
+            );
+            previousCodePoint = codePoint;
+            String probe = new String(Character.toChars(codePoint));
+            int[] actual = {
+                    finalSigmaAtEnd(probe + "Σ"),
+                    finalSigmaAtEnd("A" + probe + "Σ"),
+                    finalSigmaAfterA("AΣ" + probe),
+                    finalSigmaAfterA("AΣ" + probe + "A")
+            };
+            for (int context = 0; context < actual.length; context++) {
+                int flag = truth[offset + 4 + context] & 0xFF;
+                require(flag <= 1, "Final Sigma boundary truth flag");
+                int expected = flag == 0 ? 0x03C3 : 0x03C2;
+                if (actual[context] != expected) {
+                    mismatches++;
+                    if (firstMismatch < 0) {
+                        firstMismatch = codePoint;
+                    }
+                }
+            }
+        }
+        require(
+                mismatches == 0,
+                "Final Sigma boundary mismatches=" + mismatches
+                        + ", first=" + String.format("U+%04X", firstMismatch)
+        );
+    }
+
+    private static void testPythonFinalSigmaTruth() throws IOException {
+        String truthPath = System.getProperty("intent.final_sigma.truth");
+        if (truthPath == null) {
+            return;
+        }
+        int codePointCount = Character.MAX_CODE_POINT + 1;
+        byte[] truth = Files.readAllBytes(Path.of(truthPath));
+        require(truth.length == codePointCount * 4, "Final Sigma truth length");
+        int mismatches = 0;
+        int firstMismatch = -1;
+        for (int codePoint = 0; codePoint < codePointCount; codePoint++) {
+            String probe = new String(Character.toChars(codePoint));
+            int[] actual = {
+                    finalSigmaAtEnd(probe + "Σ"),
+                    finalSigmaAtEnd("A" + probe + "Σ"),
+                    finalSigmaAfterA("AΣ" + probe),
+                    finalSigmaAfterA("AΣ" + probe + "A")
+            };
+            for (int context = 0; context < actual.length; context++) {
+                int expected = truth[codePoint * 4 + context] == 0
+                        ? 0x03C3
+                        : 0x03C2;
+                if (actual[context] != expected) {
+                    mismatches++;
+                    if (firstMismatch < 0) {
+                        firstMismatch = codePoint;
+                    }
+                }
+            }
+        }
+        require(
+                mismatches == 0,
+                "Final Sigma context mismatches=" + mismatches
+                        + ", first=" + String.format("U+%04X", firstMismatch)
+        );
+    }
+
+    private static int finalSigmaAtEnd(String probe) {
+        String normalized = MobileIntentClassifier.normalizeText(probe);
+        return normalized.codePointBefore(normalized.length());
+    }
+
+    private static int finalSigmaAfterA(String probe) {
+        int[] normalized = MobileIntentClassifier.normalizeText(probe).codePoints().toArray();
+        return normalized[1];
+    }
+
+    private static int readBigEndianInt(byte[] source, int offset) {
+        return (source[offset] & 0xFF) << 24
+                | (source[offset + 1] & 0xFF) << 16
+                | (source[offset + 2] & 0xFF) << 8
+                | source[offset + 3] & 0xFF;
+    }
+
+    private static void testLoaderResourceLimits(
+            Path smallModelPath,
+            List<Path> temporaryArtifacts
+    ) throws IOException {
+        require(IntentModelLoader.load(smallModelPath).schemaVersion() == 1, "small artifact");
+
+        Path oversized = Files.createTempFile("oversized-intent-model-", ".json");
+        temporaryArtifacts.add(oversized);
+        writeRepeatedByte(
+                oversized,
+                IntentModelLoader.MAX_ARTIFACT_BYTES + 1,
+                (byte) ' '
+        );
+        try {
+            IntentModelLoader.load(oversized);
+            throw new AssertionError("expected oversized artifact rejection");
+        } catch (IllegalArgumentException expected) {
+            require(
+                    expected.getMessage().contains("artifact exceeds maximum size"),
+                    "artifact size error source"
+            );
+        }
+
+        Path malformedUtf8 = Files.createTempFile("malformed-intent-model-", ".json");
+        temporaryArtifacts.add(malformedUtf8);
+        Files.write(malformedUtf8, new byte[] {(byte) 0xC3, (byte) 0x28});
+        try {
+            IntentModelLoader.load(malformedUtf8);
+            throw new AssertionError("expected malformed UTF-8 rejection");
+        } catch (IOException expected) {
+            require(expected.getMessage().contains("UTF-8"), "UTF-8 error source");
+        }
+    }
+
+    private static void writeRepeatedByte(Path path, int count, byte value) throws IOException {
+        byte[] block = new byte[8192];
+        Arrays.fill(block, value);
+        try (OutputStream output = Files.newOutputStream(path)) {
+            int remaining = count;
+            while (remaining > 0) {
+                int length = Math.min(remaining, block.length);
+                output.write(block, 0, length);
+                remaining -= length;
+            }
+        }
+    }
+
+    private static void testCorruptArtifacts(
+            String artifact,
+            List<Path> temporaryArtifacts
+    ) throws IOException {
+        expectInvalidArtifact("{}", temporaryArtifacts);
+        expectInvalidArtifact(
+                insertTopLevelMember(artifact, "\"unexpected\":true"),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(artifact, "schema_version", "2"),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(artifact, "schema_version", "1.0"),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(artifact, "algorithm", "\"other\""),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(artifact, "normalization", "[]"),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(
+                        artifact,
+                        "normalization",
+                        "{\"version\":2,\"strategy\":"
+                                + "\"whole_string_lower_then_alphanumeric_filter\","
+                                + "\"ngram_range\":[1,2]}"
+                ),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(
+                        artifact,
+                        "normalization",
+                        "{\"version\":1,\"strategy\":\"other\","
+                                + "\"ngram_range\":[1,2]}"
+                ),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(
+                        artifact,
+                        "normalization",
+                        "{\"version\":1,\"strategy\":"
+                                + "\"whole_string_lower_then_alphanumeric_filter\","
+                                + "\"ngram_range\":[1,3]}"
+                ),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(artifact, "labels", "[\"cancel_order\",\"cancel_order\"]"),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(artifact, "labels", "[\"unknown\"]"),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(
+                        artifact,
+                        "labels",
+                        "[\"human_service\",\"cancel_order\"]"
+                ),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(
+                        artifact,
+                        "thresholds",
+                        "{\"confidence\":1.1,\"margin\":0.0,"
+                                + "\"minimum_accepted_accuracy\":0.75}"
+                ),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(
+                        artifact,
+                        "thresholds",
+                        "{\"confidence\":0.0,\"margin\":-0.1,"
+                                + "\"minimum_accepted_accuracy\":0.75}"
+                ),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(
+                        artifact,
+                        "thresholds",
+                        "{\"confidence\":0.0,\"margin\":0.0,"
+                                + "\"minimum_accepted_accuracy\":2}"
+                ),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceFirstObjectNumber(artifact, "class_counts", "0", false),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceFirstObjectNumber(artifact, "class_counts", "-1", false),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceFirstObjectNumber(artifact, "class_counts", "1.0", false),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceFirstObjectNumber(
+                        artifact,
+                        "class_counts",
+                        "2147483648",
+                        false
+                ),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceFirstObjectNumber(artifact, "feature_counts", "0", true),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceFirstObjectNumber(artifact, "total_features", "0", false),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceFirstObjectNumber(
+                        artifact,
+                        "total_features",
+                        "2147483647",
+                        false
+                ),
+                temporaryArtifacts
+        );
+        expectInvalidFeatureArtifact(
+                replaceFirstFeatureName(artifact, "A"),
+                temporaryArtifacts
+        );
+        expectInvalidFeatureArtifact(
+                replaceFirstFeatureName(artifact, "☃"),
+                temporaryArtifacts
+        );
+        expectInvalidFeatureArtifact(
+                replaceFirstFeatureName(artifact, "İ"),
+                temporaryArtifacts
+        );
+        expectInvalidFeatureArtifact(
+                replaceFirstFeatureName(
+                        artifact,
+                        new String(Character.toChars(0x0378))
+                ),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceFirstObjectKey(
+                        artifact,
+                        "class_counts",
+                        "external_label"
+                ),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(artifact, "vocabulary", "[]"),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                duplicateFirstArrayString(artifact, "vocabulary"),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(artifact, "training_metadata", "[]"),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(artifact, "training_metadata", "{}"),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(artifact, "evaluation_summary", "[]"),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                insertTopLevelMember(artifact, "\"schema_version\":1"),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(artifact, "model_version", "\"\\uD800\""),
+                temporaryArtifacts
+        );
+        expectInvalidArtifact(
+                replaceJsonValue(artifact, "schema_version", "01"),
+                temporaryArtifacts
+        );
+    }
+
+    private static void expectParseError(String source) {
+        try {
+            MiniJson.parse(source);
+            throw new AssertionError("expected JSON parse failure: " + source);
+        } catch (IllegalArgumentException error) {
+            require(error.getMessage().contains("position"), "JSON error position");
+        }
+    }
+
+    private static void expectInvalidArtifact(
+            String source,
+            List<Path> temporaryArtifacts
+    ) throws IOException {
+        Path path = Files.createTempFile("invalid-intent-model-", ".json");
+        temporaryArtifacts.add(path);
+        Files.writeString(path, source, StandardCharsets.UTF_8);
+        try {
+            IntentModelLoader.load(path);
+            throw new AssertionError("expected invalid artifact: " + path);
+        } catch (IllegalArgumentException expected) {
+            require(
+                    expected.getMessage() != null && !expected.getMessage().isBlank(),
+                    "artifact error message"
+            );
+        }
+    }
+
+    private static void expectInvalidFeatureArtifact(
+            String source,
+            List<Path> temporaryArtifacts
+    ) throws IOException {
+        MiniJson.parse(source);
+        Path path = Files.createTempFile("invalid-intent-feature-", ".json");
+        temporaryArtifacts.add(path);
+        Files.writeString(path, source, StandardCharsets.UTF_8);
+        try {
+            IntentModelLoader.load(path);
+            throw new AssertionError("expected invalid feature artifact: " + path);
+        } catch (IllegalArgumentException expected) {
+            require(
+                    expected.getMessage().contains(
+                            "features must be normalized one- or two-code-point n-grams"
+                    ),
+                    "feature validation error source"
+            );
+        }
+    }
+
+    private static String insertTopLevelMember(String source, String member) {
+        require(source.charAt(0) == '{', "artifact object start");
+        return "{" + member + "," + source.substring(1);
+    }
+
+    private static String replaceJsonValue(
+            String source,
+            String key,
+            String replacement
+    ) {
+        String quotedKey = "\"" + key + "\"";
+        int keyStart = source.indexOf(quotedKey);
+        require(keyStart >= 0, "missing JSON key: " + key);
+        int colon = skipWhitespace(source, keyStart + quotedKey.length());
+        require(colon < source.length() && source.charAt(colon) == ':', "key colon");
+        int valueStart = skipWhitespace(source, colon + 1);
+        int valueEnd = findJsonValueEnd(source, valueStart);
+        return source.substring(0, valueStart) + replacement + source.substring(valueEnd);
+    }
+
+    private static String replaceFirstObjectNumber(
+            String source,
+            String objectKey,
+            String replacement,
+            boolean nested
+    ) {
+        int marker = source.indexOf("\"" + objectKey + "\"");
+        require(marker >= 0, "missing object: " + objectKey);
+        int objectStart = source.indexOf('{', marker);
+        require(objectStart >= 0, "object start: " + objectKey);
+        if (nested) {
+            int outerKeyStart = source.indexOf('"', objectStart + 1);
+            int outerKeyEnd = findStringEnd(source, outerKeyStart);
+            int outerColon = source.indexOf(':', outerKeyEnd);
+            objectStart = source.indexOf('{', outerColon);
+            require(objectStart >= 0, "nested object start: " + objectKey);
+        }
+        int keyStart = source.indexOf('"', objectStart + 1);
+        int keyEnd = findStringEnd(source, keyStart);
+        int colon = source.indexOf(':', keyEnd);
+        int valueStart = skipWhitespace(source, colon + 1);
+        int valueEnd = valueStart;
+        while (valueEnd < source.length()
+                && "-+0123456789.eE".indexOf(source.charAt(valueEnd)) >= 0) {
+            valueEnd++;
+        }
+        require(valueEnd > valueStart, "numeric object value");
+        return source.substring(0, valueStart) + replacement + source.substring(valueEnd);
+    }
+
+    private static String replaceFirstFeatureName(String source, String replacement) {
+        int marker = source.indexOf("\"feature_counts\"");
+        int outerStart = source.indexOf('{', marker);
+        int labelStart = source.indexOf('"', outerStart + 1);
+        int labelEnd = findStringEnd(source, labelStart);
+        int labelColon = source.indexOf(':', labelEnd);
+        int countsStart = source.indexOf('{', labelColon);
+        int featureStart = source.indexOf('"', countsStart + 1);
+        int featureEnd = findStringEnd(source, featureStart);
+        require(featureStart >= 0 && featureEnd > featureStart, "feature name");
+        return source.substring(0, featureStart + 1)
+                + replacement
+                + source.substring(featureEnd - 1);
+    }
+
+    private static String replaceFirstObjectKey(
+            String source,
+            String objectKey,
+            String replacement
+    ) {
+        int marker = source.indexOf("\"" + objectKey + "\"");
+        require(marker >= 0, "missing object: " + objectKey);
+        int objectStart = source.indexOf('{', marker);
+        int keyStart = source.indexOf('"', objectStart + 1);
+        int keyEnd = findStringEnd(source, keyStart);
+        require(keyStart >= 0 && keyEnd > keyStart, "object key");
+        return source.substring(0, keyStart + 1)
+                + replacement
+                + source.substring(keyEnd - 1);
+    }
+
+    private static String duplicateFirstArrayString(String source, String arrayKey) {
+        int marker = source.indexOf("\"" + arrayKey + "\"");
+        require(marker >= 0, "missing array: " + arrayKey);
+        int arrayStart = source.indexOf('[', marker);
+        int stringStart = source.indexOf('"', arrayStart + 1);
+        int stringEnd = findStringEnd(source, stringStart);
+        require(stringStart >= 0 && stringEnd > stringStart, "array string");
+        String encodedValue = source.substring(stringStart, stringEnd);
+        return source.substring(0, stringStart)
+                + encodedValue
+                + ","
+                + source.substring(stringStart);
+    }
+
+    private static int findJsonValueEnd(String source, int start) {
+        char first = source.charAt(start);
+        if (first == '"') {
+            return findStringEnd(source, start);
+        }
+        if (first == '{' || first == '[') {
+            char open = first;
+            char close = first == '{' ? '}' : ']';
+            int depth = 0;
+            boolean inString = false;
+            boolean escaped = false;
+            for (int index = start; index < source.length(); index++) {
+                char current = source.charAt(index);
+                if (inString) {
+                    if (escaped) {
+                        escaped = false;
+                    } else if (current == '\\') {
+                        escaped = true;
+                    } else if (current == '"') {
+                        inString = false;
+                    }
+                } else if (current == '"') {
+                    inString = true;
+                } else if (current == open) {
+                    depth++;
+                } else if (current == close && --depth == 0) {
+                    return index + 1;
+                }
+            }
+            throw new AssertionError("unterminated JSON container");
+        }
+        int end = start;
+        while (end < source.length()
+                && source.charAt(end) != ','
+                && source.charAt(end) != '}'
+                && source.charAt(end) != ']'
+                && !Character.isWhitespace(source.charAt(end))) {
+            end++;
+        }
+        return end;
+    }
+
+    private static int findStringEnd(String source, int start) {
+        require(start >= 0 && source.charAt(start) == '"', "string start");
+        boolean escaped = false;
+        for (int index = start + 1; index < source.length(); index++) {
+            char current = source.charAt(index);
+            if (escaped) {
+                escaped = false;
+            } else if (current == '\\') {
+                escaped = true;
+            } else if (current == '"') {
+                return index + 1;
+            }
+        }
+        throw new AssertionError("unterminated JSON string");
+    }
+
+    private static int skipWhitespace(String source, int start) {
+        int index = start;
+        while (index < source.length() && Character.isWhitespace(source.charAt(index))) {
+            index++;
+        }
+        return index;
+    }
+
+    private static void expectUnsupported(ThrowingRunnable action) {
+        try {
+            action.run();
+            throw new AssertionError("expected immutable collection");
+        } catch (UnsupportedOperationException expected) {
+            // Expected.
+        } catch (Exception error) {
+            throw new AssertionError("unexpected exception", error);
+        }
+    }
+
+    private static void expectIllegalArgument(ThrowingRunnable action) {
+        try {
+            action.run();
+            throw new AssertionError("expected IllegalArgumentException");
+        } catch (IllegalArgumentException expected) {
+            // Expected.
+        } catch (Exception error) {
+            throw new AssertionError("unexpected exception", error);
+        }
+    }
+
+    private static void require(boolean condition, String message) {
+        if (!condition) {
+            throw new AssertionError(message);
+        }
+    }
+
+    @FunctionalInterface
+    private interface ThrowingRunnable {
+        void run() throws Exception;
+    }
+}
